@@ -1,0 +1,99 @@
+{
+  "name": "node-xray",
+  "displayName": "xray: real-time Node.js profiler",
+  "description": "Event loop down to each callback, CPU flame graph, heap, GC, HTTP, RAM/swap/GPU of a running Node.js process, with hot lines in the editor.",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "publisher": "bondevn",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Debuggers",
+    "Visualization"
+  ],
+  "main": "./dist/extension.cjs",
+  "contributes": {
+    "commands": [
+      {
+        "command": "xray.profileFile",
+        "title": "Profile Current File",
+        "category": "xray"
+      },
+      {
+        "command": "xray.run",
+        "title": "Profile a Command\u2026",
+        "category": "xray"
+      },
+      {
+        "command": "xray.attach",
+        "title": "Attach to a Running Node.js Process\u2026",
+        "category": "xray"
+      },
+      {
+        "command": "xray.show",
+        "title": "Show Dashboard",
+        "category": "xray"
+      },
+      {
+        "command": "xray.stop",
+        "title": "Stop",
+        "category": "xray"
+      },
+      {
+        "command": "xray.clearHotLines",
+        "title": "Clear Hot Lines",
+        "category": "xray"
+      }
+    ],
+    "configuration": {
+      "title": "xray",
+      "properties": {
+        "xray.nodePath": {
+          "type": "string",
+          "default": "node",
+          "description": "Node.js used to run xray itself (version 22 or newer). The profiled program can use any Node from version 20."
+        },
+        "xray.cpu": {
+          "type": "boolean",
+          "default": true,
+          "description": "CPU profiling from the start: flame graph and hot lines in the editor."
+        },
+        "xray.heap": {
+          "type": "boolean",
+          "default": false,
+          "description": "Allocation sampling from the start."
+        },
+        "xray.fs": {
+          "type": "boolean",
+          "default": false,
+          "description": "Time file system calls from the start, *Sync ones too (wraps the fs functions; DNS is timed always)."
+        },
+        "xray.hotLineThreshold": {
+          "type": "number",
+          "default": 0.5,
+          "minimum": 0,
+          "description": "Mark a line in the editor when it takes at least this percentage of CPU work."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "node build.mjs",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.test.json",
+    "test": "tsc -p tsconfig.test.json && node --test dist/node/test/*.test.js",
+    "package": "npm run build && npx @vscode/vsce package --no-dependencies --allow-missing-repository --skip-license",
+    "vscode:prepublish": "npm run build",
+    "test:host": "npm run build && node test-host/launch.mjs"
+  },
+  "devDependencies": {
+    "@node-xray/agent": "*",
+    "@node-xray/cli": "*",
+    "@node-xray/core": "*",
+    "@node-xray/dashboard": "*",
+    "@types/vscode": "~1.85.0",
+    "esbuild": "^0.25.12"
+  }
+}
