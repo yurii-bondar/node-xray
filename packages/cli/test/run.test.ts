@@ -123,6 +123,20 @@ describe('budgets and replay', () => {
     assert.match(met.stderr, /── budgets: 0 broken, 1 met/);
   });
 
+  it('treats a service stopped with SIGTERM as a clean stop and exits by the budgets', async () => {
+    const child = spawn(process.execPath, [bin, 'run', '--interval', '100ms', '--budget', 'loop.max<10s', '--', process.execPath, '-e', 'setInterval(() => {}, 1000)'], {
+      cwd: dir,
+      stdio: ['ignore', 'ignore', 'pipe'],
+    });
+    let stderr = '';
+    child.stderr.setEncoding('utf8').on('data', (c: string) => (stderr += c));
+    await new Promise((resolve) => setTimeout(resolve, 800));
+    child.kill('SIGTERM');
+    const code = await new Promise<number | null>((resolve) => child.on('exit', resolve));
+    assert.equal(code, 0, stderr);
+    assert.match(stderr, /── budgets: 0 broken, 1 met/);
+  });
+
   it('exits 1 for a successful command that breaks a budget', async () => {
     const program = 'setTimeout(() => { const e = Date.now() + 300; while (Date.now() < e); }, 400); setTimeout(() => {}, 900)';
     const result = await xray(['run', '--interval', '100ms', '--budget', 'loop.max<1ms', '--', process.execPath, '-e', program]);

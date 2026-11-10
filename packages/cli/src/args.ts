@@ -57,8 +57,8 @@ run     starts <command> with the xray agent preloaded into every Node.js proces
         thread it starts, then prints a summary: CPU, event loop, memory, swap, GC, GPU,
         HTTP, findings.
 attach  profiles a Node.js process that is already running, without restarting it: opens
-        its inspector (SIGUSR1), injects the agent, and on Ctrl+C removes it and closes the
-        inspector again. Main thread only.
+        its inspector (SIGUSR1), injects the agent into it and its worker threads, and on
+        Ctrl+C removes it and closes the inspector again.
 replay  reads a --record file back: summary, dashboard, report, profiles, budgets.
 
 Options:

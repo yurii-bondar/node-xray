@@ -62,6 +62,23 @@ async function waitForExit(child: ChildProcess, command: string, stderr: NodeJS.
   }
 }
 
+export interface ExitArgs {
+  /** The command's exit code (128 + n when a signal ended it). */
+  readonly code: number;
+  readonly signal: NodeJS.Signals | null;
+  readonly budgetsFailed: boolean;
+}
+
+/**
+ * The command's own failure wins, else a broken budget fails the run. A service stopped with
+ * Ctrl+C or SIGTERM (how a profiled server or a load test ends) is a clean stop, not a failure.
+ */
+export function runExitCode({ code, signal, budgetsFailed }: ExitArgs): number {
+  const stopped = signal === 'SIGINT' || signal === 'SIGTERM';
+  if (stopped || code === 0) return budgetsFailed ? 1 : 0;
+  return code;
+}
+
 export interface RunResult {
   readonly exitCode: number;
   readonly sources: readonly SourceReport[];
@@ -92,8 +109,7 @@ export async function run(options: RunOptions, stderr: NodeJS.WritableStream = p
       await waitForInterrupt();
     }
     const outcome = await session.finish();
-    // The command's own failure wins; otherwise a broken budget fails the run.
-    return { exitCode: code === 0 && outcome.failed ? 1 : code, sources: outcome.sources };
+    return { exitCode: runExitCode({ code, signal: exit.signal, budgetsFailed: outcome.failed }), sources: outcome.sources };
   } finally {
     await session.close();
     await rm(dir, { recursive: true, force: true });
