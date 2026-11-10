@@ -1,0 +1,8 @@
+node_modules/
+dist/
+*.vsix
+*.log
+*.xray.jsonl
+*.cpuprofile
+*.heapprofile
+.DS_Store

@@ -1,0 +1,29 @@
+{
+  "name": "node-xray",
+  "private": true,
+  "description": "Real-time profiler for Node.js processes: event loop, heap, GC, CPU",
+  "license": "MIT",
+  "workspaces": [
+    "packages/core",
+    "packages/agent",
+    "packages/dashboard",
+    "packages/cli",
+    "packages/vscode"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "lint": "eslint .",
+    "test": "npm test --workspaces --if-present"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.5",
+    "@types/node": "^22.20.5",
+    "eslint": "^9.39.5",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.72.1"
+  }
+}
