@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import { parseArgs, parseDuration } from '../src/args.js';
-import { withPreload } from '../src/run.js';
+import { runExitCode, withPreload } from '../src/run.js';
 import { startupCommands } from '../src/session.js';
 
 describe('parseDuration', () => {
@@ -84,6 +84,15 @@ describe('run helpers', () => {
     assert.equal(withPreload(undefined, '/My Apps/agent.cjs'), '--require "/My Apps/agent.cjs"');
     assert.equal(withPreload(' --max-old-space-size=512 ', '/a.cjs'), '--max-old-space-size=512 --require "/a.cjs"');
     assert.equal(withPreload('', 'C:\\x\\a.cjs'), '--require "C:\\\\x\\\\a.cjs"');
+  });
+
+  it('decides the exit code: the command first, then budgets; a stop by signal is clean', () => {
+    assert.equal(runExitCode({ code: 3, signal: null, budgetsFailed: false }), 3);
+    assert.equal(runExitCode({ code: 3, signal: null, budgetsFailed: true }), 3);
+    assert.equal(runExitCode({ code: 0, signal: null, budgetsFailed: true }), 1);
+    assert.equal(runExitCode({ code: 143, signal: 'SIGTERM', budgetsFailed: false }), 0);
+    assert.equal(runExitCode({ code: 130, signal: 'SIGINT', budgetsFailed: true }), 1);
+    assert.equal(runExitCode({ code: 137, signal: 'SIGKILL', budgetsFailed: false }), 137);
   });
 
   it('turns flags into startup commands', () => {
