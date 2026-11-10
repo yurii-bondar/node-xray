@@ -1,0 +1,28 @@
+{
+  "name": "@node-xray/agent",
+  "version": "0.0.0",
+  "private": true,
+  "description": "node-xray agent: runs inside the profiled process and streams metrics to the CLI",
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": "./dist/agent.cjs",
+    "./attach": "./dist/attach.cjs"
+  },
+  "files": [
+    "dist/agent.cjs",
+    "dist/attach.cjs"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "esbuild src/index.ts --bundle --platform=node --format=cjs --target=node20 --outfile=dist/agent.cjs && esbuild src/attach.ts --bundle --platform=node --format=cjs --target=node20 --outfile=dist/attach.cjs",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.test.json",
+    "test": "npm run build && tsc -p tsconfig.test.json && node --test dist/test/*.test.js"
+  },
+  "devDependencies": {
+    "@node-xray/core": "*",
+    "esbuild": "^0.25.12"
+  }
+}
