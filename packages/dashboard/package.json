@@ -1,0 +1,24 @@
+{
+  "name": "@node-xray/dashboard",
+  "version": "0.0.0",
+  "private": true,
+  "description": "node-xray live dashboard: charts, event loop lane, flame graph",
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "node build.mjs",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.test.json",
+    "test": "tsc -p tsconfig.test.json && node --test dist/node/test/*.test.js"
+  },
+  "devDependencies": {
+    "@node-xray/core": "*",
+    "esbuild": "^0.25.12",
+    "uplot": "1.6.32"
+  }
+}

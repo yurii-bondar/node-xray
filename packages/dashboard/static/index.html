@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>xray</title>
+    <link rel="stylesheet" href="uplot.css" />
+    <link rel="stylesheet" href="app.css" />
+  </head>
+  <body>
+    <header class="bar">
+      <div class="brand">xray</div>
+      <select id="source" aria-label="Process"></select>
+      <span id="status" class="pill">connecting…</span>
+      <div class="spacer"></div>
+      <label class="field">window
+        <select id="window">
+          <option value="60000">1 min</option>
+          <option value="300000" selected>5 min</option>
+          <option value="900000">15 min</option>
+          <option value="0">all</option>
+        </select>
+      </label>
+      <button id="pause" type="button" class="ghost">Pause</button>
+    </header>
+
+    <main>
+      <section id="tiles" class="tiles" aria-label="Now"></section>
+      <section id="findings" class="findings" hidden></section>
+
+      <section class="panel" id="loop-panel">
+        <div class="panel-head">
+          <h2>Event loop</h2>
+          <button id="trace" type="button">Trace callbacks 10 s</button>
+          <label class="field">span
+            <select id="span">
+              <option value="100">100 ms</option>
+              <option value="250">250 ms</option>
+              <option value="1000" selected>1 s</option>
+              <option value="5000">5 s</option>
+            </select>
+          </label>
+          <div id="lane-legend" class="legend"></div>
+        </div>
+        <p id="lane-empty" class="hint">Every callback the loop runs, as it runs: timers, I/O, immediates, nextTicks, microtasks, promises and GC pauses, grouped by loop iteration. Tracing uses async_hooks and slows the process down, so it runs for 10 s at a time.</p>
+        <div class="lane-wrap" id="lane-wrap" hidden>
+          <canvas id="lane" class="lane"></canvas>
+          <div id="lane-tip" class="tip" hidden></div>
+        </div>
+        <div class="iter-wrap" id="iter-wrap" hidden>
+          <div class="sub">Loop iterations <span class="muted">(newest right; click one)</span></div>
+          <canvas id="iterations" class="iterations"></canvas>
+          <div id="iteration-detail" class="iteration-detail"></div>
+        </div>
+        <div class="grid2">
+          <div id="chart-loop-delay"></div>
+          <div id="chart-loop-rate"></div>
+        </div>
+        <div class="grid2">
+          <div>
+            <div class="sub">Waiting in the loop's queues <span class="muted">(since tracing started)</span></div>
+            <table class="table" id="queues"><thead><tr><th>resource</th><th>kind</th><th class="num">pending</th><th class="num">ran</th><th class="num">time</th></tr></thead><tbody></tbody></table>
+          </div>
+          <div>
+            <div class="sub">Active handles</div>
+            <table class="table" id="handles"><thead><tr><th>type</th><th class="num">count</th></tr></thead><tbody></tbody></table>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel" id="http-panel" hidden>
+        <div class="panel-head">
+          <h2>HTTP</h2>
+          <span class="muted">from diagnostics_channel: requests served (http/https) and made (http.request, fetch)</span>
+        </div>
+        <div class="grid2">
+          <div id="chart-http-rate"></div>
+          <div id="chart-http-latency"></div>
+        </div>
+        <div class="grid2">
+          <div>
+            <div class="sub">Routes served <span class="muted">(in the chart window, by total time)</span></div>
+            <table class="table" id="http-routes"><thead><tr><th>route</th><th class="num">requests</th><th class="num">avg</th><th class="num">max</th><th class="num">errors</th><th class="num">total</th></tr></thead><tbody></tbody></table>
+          </div>
+          <div>
+            <div class="sub">Requests made <span class="muted">(by host and path)</span></div>
+            <table class="table" id="http-calls"><thead><tr><th>call</th><th class="num">requests</th><th class="num">avg</th><th class="num">max</th><th class="num">errors</th><th class="num">total</th></tr></thead><tbody></tbody></table>
+          </div>
+        </div>
+        <div class="grid2">
+          <div>
+            <div class="sub">Slowest requests</div>
+            <table class="table" id="http-slowest"><thead><tr><th>request</th><th class="num">status</th><th class="num">time</th></tr></thead><tbody></tbody></table>
+          </div>
+          <div>
+            <div class="sub">Running now <span class="muted">(over a second)</span></div>
+            <table class="table" id="http-running"><thead><tr><th>request</th><th class="num">running for</th></tr></thead><tbody></tbody></table>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel" id="io-panel">
+        <div class="panel-head">
+          <h2>Files &amp; DNS</h2>
+          <button id="fs-toggle" type="button">Start fs timing</button>
+          <span class="muted">DNS is timed always. File system timing wraps the fs functions while it is on; *Sync calls block the event loop.</span>
+        </div>
+        <div class="grid2">
+          <div id="chart-io-rate"></div>
+          <div id="chart-io-latency"></div>
+        </div>
+        <div class="grid2">
+          <div>
+            <div class="sub">File system calls <span class="muted">(in the chart window, by total time)</span></div>
+            <table class="table" id="io-fs"><thead><tr><th>call</th><th class="num">count</th><th class="num">avg</th><th class="num">max</th><th class="num">failed</th><th class="num">total</th></tr></thead><tbody></tbody></table>
+          </div>
+          <div>
+            <div class="sub">Blocking (*Sync) calls</div>
+            <table class="table" id="io-sync"><thead><tr><th>call</th><th class="num">count</th><th class="num">avg</th><th class="num">max</th><th class="num">failed</th><th class="num">blocked</th></tr></thead><tbody></tbody></table>
+          </div>
+        </div>
+        <div>
+          <div class="sub">DNS lookups</div>
+          <table class="table" id="io-dns"><thead><tr><th>lookup</th><th class="num">count</th><th class="num">avg</th><th class="num">max</th><th class="num">failed</th><th class="num">total</th></tr></thead><tbody></tbody></table>
+        </div>
+      </section>
+
+      <section class="panel" id="cpu-panel">
+        <div class="panel-head">
+          <h2>CPU</h2>
+          <button id="cpu-toggle" type="button">Start CPU profile</button>
+          <button id="baseline" type="button" class="ghost" hidden>Pin as baseline</button>
+          <a id="cpu-download" class="button ghost" download hidden>Download .cpuprofile</a>
+          <span id="flame-crumb" class="muted crumb"></span>
+          <button id="flame-reset" type="button" class="ghost" hidden>Reset zoom</button>
+        </div>
+        <div id="chart-cpu"></div>
+        <div class="flame-wrap" id="flame-wrap" hidden>
+          <div class="sub">Flame graph <span class="muted" id="flame-note">(last 10 s; click to zoom)</span></div>
+          <canvas id="flame" class="flame"></canvas>
+          <div id="flame-tip" class="tip" hidden></div>
+        </div>
+        <table class="table" id="hot" hidden><thead><tr><th class="num">self</th><th>function</th><th>where</th></tr></thead><tbody></tbody></table>
+        <table class="table" id="changes" hidden><thead><tr><th class="num">change</th><th class="num">now</th><th class="num">baseline</th><th>function</th><th>where</th></tr></thead><tbody></tbody></table>
+      </section>
+
+      <section class="panel" id="memory-panel">
+        <div class="panel-head">
+          <h2>Memory</h2>
+          <button id="heap-toggle" type="button">Start allocation sampling</button>
+          <a id="heap-download" class="button ghost" download hidden>Download .heapprofile</a>
+        </div>
+        <div id="chart-memory"></div>
+        <div class="grid2">
+          <div>
+            <div class="sub">Heap spaces <span class="muted">(used of size)</span></div>
+            <div id="spaces" class="spaces"></div>
+          </div>
+          <div>
+            <div class="sub">Top allocation sites <span class="muted">(sampled)</span></div>
+            <table class="table" id="allocations"><thead><tr><th class="num">bytes</th><th>function</th><th>where</th></tr></thead><tbody></tbody></table>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel" id="gc-panel">
+        <div class="panel-head"><h2>Garbage collector</h2></div>
+        <div class="grid2">
+          <div id="chart-gc"></div>
+          <div>
+            <div class="sub">Latest pauses</div>
+            <table class="table" id="gc-list"><thead><tr><th>when</th><th>kind</th><th class="num">pause</th></tr></thead><tbody></tbody></table>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel" id="system-panel">
+        <div class="panel-head"><h2>System</h2></div>
+        <div class="grid2">
+          <div id="chart-os"></div>
+          <div id="chart-host"></div>
+        </div>
+        <div id="host-facts" class="facts"></div>
+      </section>
+    </main>
+    <script type="module" src="app.js"></script>
+  </body>
+</html>
