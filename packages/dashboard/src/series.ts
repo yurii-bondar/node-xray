@@ -1,4 +1,6 @@
-// Frames → column arrays for uPlot (x in seconds). No DOM here.
+// Frames → column arrays for uPlot (x in seconds), sparklines and GC summaries. No DOM here.
+
+import type { GcEvent, GcKind } from '@node-xray/core';
 
 export type Column = Array<number | null>;
 
@@ -54,4 +56,77 @@ export function markerTimes(times: readonly number[], gapMs: number): number[] {
     previous = t;
   }
   return out;
+}
+
+export interface SparkArgs {
+  readonly values: readonly (number | null)[];
+  readonly width: number;
+  readonly height: number;
+}
+
+/** SVG path of a sparkline scaled from 0 to the maximum; a `null` breaks the line. '' when there is nothing to draw. */
+export function sparkPath({ values, width, height }: SparkArgs): string {
+  if (values.length < 2) return '';
+  let max = 0;
+  for (const v of values) if (v !== null && v > max) max = v;
+  const step = width / (values.length - 1);
+  const parts: string[] = [];
+  let pen = false;
+  for (let i = 0; i < values.length; i++) {
+    const v = values[i] ?? null;
+    if (v === null) {
+      pen = false;
+      continue;
+    }
+    const y = max > 0 ? height - (Math.max(0, v) / max) * height : height;
+    parts.push(`${pen ? 'L' : 'M'}${(i * step).toFixed(1)} ${y.toFixed(1)}`);
+    pen = true;
+  }
+  return parts.length < 2 ? '' : parts.join(' ');
+}
+
+/** V8's names for the pause kinds, as the GC trace and DevTools show them. */
+export const GC_LABEL: Readonly<Record<GcKind, string>> = {
+  minor: 'Scavenge',
+  major: 'Mark-Compact',
+  incremental: 'Incremental marking',
+  weakcb: 'Weak callbacks',
+  other: 'Other',
+};
+
+export interface GcKindRow {
+  readonly kind: GcKind;
+  readonly runs: number;
+  readonly avg: number;
+  readonly max: number;
+  readonly total: number;
+}
+
+/** Pauses grouped by kind, most total pause first. */
+export function gcByKind(events: readonly GcEvent[]): GcKindRow[] {
+  const byKind = new Map<GcKind, { runs: number; max: number; total: number }>();
+  for (const e of events) {
+    const row = byKind.get(e.kind) ?? { runs: 0, max: 0, total: 0 };
+    row.runs++;
+    row.max = Math.max(row.max, e.duration);
+    row.total += e.duration;
+    byKind.set(e.kind, row);
+  }
+  return [...byKind]
+    .map(([kind, { runs, max, total }]) => ({ kind, runs, avg: total / runs, max, total }))
+    .sort((a, b) => b.total - a.total);
+}
+
+/** Upper bounds (ms) of the pause histogram buckets; one more bucket holds everything above the last. */
+export const PAUSE_BUCKETS: readonly number[] = [1, 5, 20, 50, 100, 250];
+
+/** Pauses per bucket of `PAUSE_BUCKETS` (`PAUSE_BUCKETS.length + 1` counts). */
+export function pauseHistogram(events: readonly GcEvent[]): number[] {
+  const counts = new Array<number>(PAUSE_BUCKETS.length + 1).fill(0);
+  for (const e of events) {
+    let i = 0;
+    while (i < PAUSE_BUCKETS.length && e.duration >= (PAUSE_BUCKETS[i] as number)) i++;
+    counts[i] = (counts[i] as number) + 1;
+  }
+  return counts;
 }

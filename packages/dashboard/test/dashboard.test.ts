@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { cpuFlame, encodeRecord, toLoopEvents, groupIterations, type CpuProfile, type Hello, type LoopTraceEvent } from '@node-xray/core';
+import { cpuFlame, encodeRecord, toLoopEvents, groupIterations, type CpuProfile, type GcEvent, type Hello, type InsightSummary, type LoopTraceEvent } from '@node-xray/core';
 import { findByPath, frameKind, layoutFlame, nodeKey } from '../src/flame-layout.js';
 import { hitTest, iterationDetail, layoutLane } from '../src/lane-layout.js';
 import { OriginalsCache, parseOriginals } from '../src/originals.js';
-import { columns, markerTimes, shortIoKey } from '../src/series.js';
+import { insightLevel, insightPage, pageAlerts, parseRoute } from '../src/nav.js';
+import { columns, gcByKind, markerTimes, pauseHistogram, shortIoKey, sparkPath } from '../src/series.js';
 import { parseStatus, sourceLabel, Store } from '../src/store.js';
 
 const hello: Hello = {
@@ -219,5 +220,55 @@ describe('OriginalsCache', () => {
     cache.get(position);
     await new Promise((resolve) => setTimeout(resolve, 0));
     assert.equal(calls, 1);
+  });
+});
+
+describe('navigation', () => {
+  it('reads the page from the hash and falls back to the overview', () => {
+    assert.equal(parseRoute('#/gc'), 'gc');
+    assert.equal(parseRoute('#loop'), 'loop');
+    assert.equal(parseRoute(''), 'overview');
+    assert.equal(parseRoute('#/nope'), 'overview');
+  });
+
+  it('sends each finding to its page and keeps the worst level per page', () => {
+    assert.equal(insightPage('gc-pressure'), 'gc');
+    assert.equal(insightPage('fs-blocking'), 'io');
+    assert.equal(insightLevel('http-slow'), 'warn');
+    const summary = (kind: InsightSummary['kind']): InsightSummary => ({ kind, count: 1, worst: { kind: 'detached-contexts', t: 0, count: 1 }, culprit: null });
+    const alerts = pageAlerts([summary('http-slow'), summary('http-errors'), summary('heap-growth'), summary('http-slow')]);
+    assert.equal(alerts.get('http'), 'bad');
+    assert.equal(alerts.get('memory'), 'warn');
+    assert.equal(alerts.has('loop'), false);
+  });
+});
+
+describe('sparkPath', () => {
+  it('scales from zero to the maximum and breaks at gaps', () => {
+    assert.equal(sparkPath({ values: [0, 5, 10], width: 100, height: 20 }), 'M0.0 20.0 L50.0 10.0 L100.0 0.0');
+    assert.equal(sparkPath({ values: [1, null, 1, 1], width: 30, height: 10 }), 'M0.0 0.0 M20.0 0.0 L30.0 0.0');
+    assert.equal(sparkPath({ values: [0, 0], width: 10, height: 10 }), 'M0.0 10.0 L10.0 10.0');
+    assert.equal(sparkPath({ values: [3], width: 10, height: 10 }), '');
+  });
+});
+
+describe('GC summaries', () => {
+  const gc = (kind: GcEvent['kind'], duration: number): GcEvent => ({ start: 0, duration, kind });
+  const events = [gc('minor', 0.5), gc('minor', 2), gc('major', 120), gc('major', 300), gc('incremental', 6)];
+
+  it('groups pauses by kind, most total first', () => {
+    assert.deepEqual(
+      gcByKind(events).map((row) => [row.kind, row.runs, row.max, row.total]),
+      [
+        ['major', 2, 300, 420],
+        ['incremental', 1, 6, 6],
+        ['minor', 2, 2, 2.5],
+      ],
+    );
+  });
+
+  it('counts pauses per bucket, the last one open-ended', () => {
+    assert.deepEqual(pauseHistogram(events), [1, 1, 1, 0, 0, 1, 1]);
+    assert.deepEqual(pauseHistogram([]), [0, 0, 0, 0, 0, 0, 0]);
   });
 });
