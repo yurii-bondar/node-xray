@@ -32,11 +32,15 @@ export interface SourceEntry {
   readonly timeline: Timeline;
 }
 
+/** `node server.js`: the script without its directory. */
+export function commandLabel(hello: Hello): string {
+  const script = hello.argv[1];
+  return script === undefined ? 'node' : `node ${script.split(/[\\/]/).pop() ?? script}`;
+}
+
 /** `pid 4242 · node server.js` (`· worker 1` for threads). */
 export function sourceLabel(hello: Hello): string {
-  const script = hello.argv[1];
-  const name = script === undefined ? 'node' : `node ${script.split(/[\\/]/).pop() ?? script}`;
-  return `pid ${hello.pid}${hello.threadId === 0 ? '' : ` · worker ${hello.threadId}`} · ${name}`;
+  return `pid ${hello.pid}${hello.threadId === 0 ? '' : ` · worker ${hello.threadId}`} · ${commandLabel(hello)}`;
 }
 
 export class Store {

@@ -99,3 +99,51 @@ export function showTip(tip: HTMLElement, text: string, x: number, y: number): v
   tip.style.left = `${Math.max(4, Math.min(x + 12, maxX))}px`;
   tip.style.top = `${y + 14}px`;
 }
+
+/** An element with a class and text (textContent: safe for names from the target). */
+export function el<K extends keyof HTMLElementTagNameMap>(tag: K, className: string, text?: string): HTMLElementTagNameMap[K] {
+  const element = document.createElement(tag);
+  if (className !== '') element.className = className;
+  if (text !== undefined) element.textContent = text;
+  return element;
+}
+
+const SVG = 'http://www.w3.org/2000/svg';
+const SPARK_WIDTH = 120;
+const SPARK_HEIGHT = 24;
+
+/** A sparkline drawn in `colorVar`, stretched to its box; the path data comes from `sparkPath`. */
+export function sparkline(d: string, colorVar: string): SVGSVGElement {
+  const svg = document.createElementNS(SVG, 'svg');
+  svg.setAttribute('class', 'spark');
+  svg.setAttribute('viewBox', `0 0 ${SPARK_WIDTH} ${SPARK_HEIGHT}`);
+  svg.setAttribute('preserveAspectRatio', 'none');
+  svg.setAttribute('aria-hidden', 'true');
+  svg.style.color = `var(${colorVar})`;
+  const area = document.createElementNS(SVG, 'path');
+  area.setAttribute('class', 'spark-area');
+  area.setAttribute('d', d === '' ? '' : `${d} L${SPARK_WIDTH} ${SPARK_HEIGHT} L0 ${SPARK_HEIGHT} Z`);
+  const line = document.createElementNS(SVG, 'path');
+  line.setAttribute('class', 'spark-line');
+  line.setAttribute('d', d);
+  svg.append(area, line);
+  return svg;
+}
+
+export const SPARK_BOX = { width: SPARK_WIDTH, height: SPARK_HEIGHT } as const;
+
+/** A group of `button[data-value]`: one is pressed; a click reports the value. */
+export function segmented(group: HTMLElement, onPick: (value: string) => void): void {
+  group.addEventListener('click', (event) => {
+    const target = event.target;
+    if (!(target instanceof HTMLButtonElement)) return;
+    const value = target.dataset['value'];
+    if (value === undefined) return;
+    pressSegment(group, value);
+    onPick(value);
+  });
+}
+
+export function pressSegment(group: HTMLElement, value: string): void {
+  for (const button of group.querySelectorAll('button')) button.setAttribute('aria-pressed', String(button.dataset['value'] === value));
+}
