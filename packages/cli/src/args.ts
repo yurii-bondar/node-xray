@@ -29,7 +29,8 @@ export interface RunOptions extends SessionOptions {
 }
 
 export interface AttachOptions extends SessionOptions {
-  readonly pid: number;
+  /** The process to signal; `null` with `--remote`: the inspector is already open and the process is not on this machine. */
+  readonly pid: number | null;
   /** Where the target's inspector listens (SIGUSR1 opens it on 9229). */
   readonly inspectPort: number;
   /** Detach after this long; `null` = on Ctrl+C or when the process exits. */
@@ -51,6 +52,7 @@ export type Cli =
 
 export const USAGE = `Usage: xray run [options] [--] <command> [args...]
        xray attach [options] <pid>
+       xray attach [options] --remote <port>
        xray replay [options] <file.xray.jsonl>
 
 run     starts <command> with the xray agent preloaded into every Node.js process and
@@ -59,6 +61,9 @@ run     starts <command> with the xray agent preloaded into every Node.js proces
 attach  profiles a Node.js process that is already running, without restarting it: opens
         its inspector (SIGUSR1), injects the agent into it and its worker threads, and on
         Ctrl+C removes it and closes the inspector again.
+        --remote <port> attaches to an inspector that is already open on 127.0.0.1:<port> and
+        belongs to a process on another machine (a container, a pod behind a port-forward): no
+        pid, no signal, the agent is sent as source, and the inspector is closed on detach.
 replay  reads a --record file back: summary, dashboard, report, profiles, budgets.
 
 Options:
@@ -79,6 +84,7 @@ Options:
                             heap.growth native.growth gc.pause gc.max http.p50 http.p99 http.errors
                             http.rps http.out.p99 http.out.errors fs.p99 fs.sync dns.p99 dns.max
   --inspect-port <n>        attach: the target's inspector port (default 9229)
+  --remote <port>           attach: the target is behind an open inspector on 127.0.0.1:<port>, not a local pid
   --duration <duration>     attach: detach after this long
   -h, --help                show this help
   -v, --version             show the version
@@ -92,6 +98,7 @@ Examples:
   xray run --report report.json -- node --max-old-space-size=512 worker.js
   xray attach --open --cpu 4242
   xray attach --duration 30s --profiles ./profiles 4242
+  xray attach --remote 19229 --open --port 4000
   xray run --budget "loop.p99<50ms,http.p99<300ms,heap.growth<5MiB/min" -- node server.js
   xray replay --open run.xray.jsonl`;
 
@@ -125,6 +132,7 @@ export function parseArgs(argv: readonly string[]): Cli {
   let report: string | null = null;
   let profiles: string | null = null;
   let inspectPort = 9229;
+  let remote = false;
   let durationMs: number | null = null;
   const budgetTexts: string[] = [];
 
@@ -166,8 +174,9 @@ export function parseArgs(argv: readonly string[]): Cli {
         open = true;
         break;
       case '--port':
+      case '--remote':
       case '--inspect-port': {
-        if (arg === '--inspect-port' && verb !== 'attach') return { kind: 'error', message: '--inspect-port is for attach' };
+        if ((arg === '--inspect-port' || arg === '--remote') && verb !== 'attach') return { kind: 'error', message: `${arg} is for attach` };
         const text = value(arg);
         if (typeof text !== 'string') return { kind: 'error', message: text.error };
         const n = Number(text);
@@ -175,7 +184,10 @@ export function parseArgs(argv: readonly string[]): Cli {
         if (arg === '--port') {
           port = n;
           ui = true;
-        } else inspectPort = n;
+        } else {
+          inspectPort = n;
+          if (arg === '--remote') remote = true;
+        }
         break;
       }
       case '--budget': {
@@ -230,6 +242,10 @@ export function parseArgs(argv: readonly string[]): Cli {
     if (first === undefined) return { kind: 'error', message: 'missing <file> to replay' };
     if (more.length > 0) return { kind: 'error', message: `unexpected '${more.join(' ')}' after the file` };
     return { kind: 'replay', options: { ...session, file: first } };
+  }
+  if (verb === 'attach' && remote) {
+    if (first !== undefined) return { kind: 'error', message: `--remote attaches to a port, not a pid: unexpected '${first}'` };
+    return { kind: 'attach', options: { ...session, pid: null, inspectPort, durationMs } };
   }
   if (verb === 'attach') {
     if (first === undefined) return { kind: 'error', message: 'missing <pid> to attach to' };

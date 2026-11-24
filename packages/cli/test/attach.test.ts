@@ -5,7 +5,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import path from 'node:path';
 import { after, describe, it } from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { injection, looksLikeNode } from '../src/attach.js';
+import { injection, looksLikeNode, remoteInjection } from '../src/attach.js';
 import { debuggerUrl } from '../src/cdp.js';
 
 const bin = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../src/bin.js');
@@ -63,7 +63,35 @@ describe('attach helpers', () => {
   });
 });
 
+describe('remote injection', () => {
+  it('runs the bundle source as a CommonJS module under a fixed file name, then starts it', () => {
+    const code = remoteInjection({ source: 'module.exports = 1; // "quoted"', binding: '__xray_send', intervalMs: 250 });
+    assert.match(code, /createRequire\("\/xray\/attach\.cjs"\)/);
+    assert.ok(code.includes(JSON.stringify('module.exports = 1; // "quoted"')), 'the source is embedded as one string literal');
+    assert.match(code, /filename: "\/xray\/attach\.cjs"/);
+    assert.match(code, /\.start\(\{"binding":"__xray_send","intervalMs":250\}\);$/);
+  });
+});
+
 describe('xray attach', () => {
+  it('attaches to an inspector that is already open without a pid, and closes it on detach', async () => {
+    const target = start(process.execPath, ['--inspect=127.0.0.1:9346', '-e', 'setInterval(() => { const e = Date.now() + 5; while (Date.now() < e); }, 20)']);
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    const result = await xray(['attach', '--remote', '9346', '--duration', '2s', '--interval', '250ms']);
+    assert.equal(result.code, 0, result.stderr);
+    assert.match(result.stderr, /attached to remote pid \d+ \(node /);
+    assert.match(result.stderr, /detached from remote pid \d+, inspector closed\./);
+    assert.match(result.stderr, /── node {2}\(pid \d+, v[\d.]+, [\d.]+ s, \d+ samples\)/);
+    assert.ok(alive(target.pid as number), 'the process keeps running');
+    assert.equal(await fetch('http://127.0.0.1:9346/json/list').then(() => 'open', () => 'closed'), 'closed');
+  });
+
+  it('says when nothing answers on the remote port', async () => {
+    const result = await xray(['attach', '--remote', '9347']);
+    assert.equal(result.code, 1);
+    assert.match(result.stderr, /nothing answers on 127\.0\.0\.1:9347/);
+  });
+
   it('profiles a running process, then leaves it running with the inspector closed', async () => {
     const target = start(process.execPath, ['-e', 'const t = setInterval(() => { const e = Date.now() + 5; while (Date.now() < e); }, 20); setTimeout(() => clearInterval(t), 20000)']);
     await new Promise((resolve) => setTimeout(resolve, 300));
