@@ -12,6 +12,7 @@ import type { AttachOptions } from './args.js';
 import { assets } from './assets.js';
 import { connectCdp, evaluate, findInspector, workerCdp, type Cdp } from './cdp.js';
 import type { Collector, OpenLink } from './collector.js';
+import { readFileSync } from 'node:fs';
 import { Interrupts, openSession, type Session, type SessionArgs } from './session.js';
 
 const BINDING = '__xray_send';
@@ -52,6 +53,32 @@ export function injection({ bundle, binding, intervalMs }: Injection): string {
   return [
     // createRequire works in worker threads too; the console's `require` is the fallback for Node < 20.16.
     `(process.getBuiltinModule ? process.getBuiltinModule('node:module').createRequire(${file}) : typeof require === 'function' ? require : process.mainModule.require.bind(process.mainModule))(${file});`,
+    `${API}.start(${JSON.stringify({ binding, intervalMs })});`,
+  ].join('\n');
+}
+
+export interface RemoteInjection {
+  /** The attach bundle's source: the target has no copy of it on its disk. */
+  readonly source: string;
+  readonly binding: string;
+  readonly intervalMs: number;
+}
+
+/** Where the remote bundle claims to live; the agent finds its own frames by this name. */
+const REMOTE_FILE = '/xray/attach.cjs';
+
+/**
+ * Code a thread on another machine evaluates: run the bundle's source as a CommonJS module with a
+ * fixed file name, then start the agent.
+ */
+export function remoteInjection({ source, binding, intervalMs }: RemoteInjection): string {
+  const file = JSON.stringify(REMOTE_FILE);
+  return [
+    `(function () {`,
+    `var req = process.getBuiltinModule ? process.getBuiltinModule('node:module').createRequire(${file}) : typeof require === 'function' ? require : process.mainModule.require.bind(process.mainModule);`,
+    `var m = { exports: {} };`,
+    `req('node:vm').runInThisContext('(function (exports, require, module, __filename, __dirname) {' + ${JSON.stringify(source)} + '\\n})', { filename: ${file} })(m.exports, req, m, ${file}, '/xray');`,
+    `})();`,
     `${API}.start(${JSON.stringify({ binding, intervalMs })});`,
   ].join('\n');
 }
@@ -161,10 +188,11 @@ export interface AttachArgs {
 
 export async function attachWith({ options, stderr, interrupts, edges }: AttachArgs): Promise<AttachResult> {
   const { pid, inspectPort } = options;
-  edges.assertAlive(pid);
+  if (pid !== null) edges.assertAlive(pid);
   const existing = await edges.findInspector(inspectPort);
-  const opened = existing === null;
-  if (opened) await edges.assertNode(pid);
+  // A remote inspector was opened for xray by whoever started it, so xray closes it too.
+  const opened = existing === null || pid === null;
+  if (existing === null && pid !== null) await edges.assertNode(pid);
   if (interrupts.count > 0) throw new AttachError('interrupted before attaching');
 
   let cdp: Cdp | null = null;
@@ -181,7 +209,13 @@ export async function attachWith({ options, stderr, interrupts, edges }: AttachA
   const acking = new AbortController();
   try {
     let url = existing;
-    if (url === null) {
+    if (url === null && pid === null) {
+      url = await waitForInspector(edges, inspectPort);
+      if (url === null) {
+        clean = true;
+        throw new AttachError(`nothing answers on 127.0.0.1:${inspectPort}: open the inspector in the process and forward that port first`);
+      }
+    } else if (url === null && pid !== null) {
       edges.openInspector(pid);
       url = await waitForInspector(edges, inspectPort);
       if (url === null) {
@@ -194,21 +228,26 @@ export async function attachWith({ options, stderr, interrupts, edges }: AttachA
       }
     }
 
+    if (url === null) throw new AttachError('no inspector to attach to');
+
     const main = await edges.connect(url);
     cdp = main;
     const actual = await evaluate(main, 'process.pid');
-    if (actual !== pid) throw new AttachError(`the inspector on 127.0.0.1:${inspectPort} belongs to pid ${String(actual)}, not ${pid}`);
+    if (pid !== null && actual !== pid) throw new AttachError(`the inspector on 127.0.0.1:${inspectPort} belongs to pid ${String(actual)}, not ${pid}`);
     verified = true;
     const title = String(await evaluate(main, "process.argv.slice(1).map((a) => a.split(/[\\\\/]/).pop()).join(' ')"));
-    const label = `attach ${pid} (node ${title})`;
+    const where = pid === null ? `remote pid ${String(actual)}` : `pid ${pid}`;
+    const label = `attach ${where} (node ${title})`;
 
-    const opening = await edges.openSession({ options, status: { state: 'running', command: label }, stderr, probeHost: true });
+    // The host probe reads this machine's swap and GPU: wrong numbers for a process somewhere else.
+    const opening = await edges.openSession({ options, status: { state: 'running', command: label }, stderr, probeHost: pid !== null });
     session = opening;
     const collector = opening.collector;
     const bundle = edges.bundle();
+    const code = pid === null ? remoteInjection({ source: readFileSync(bundle, 'utf8'), binding: BINDING, intervalMs: options.intervalMs }) : injection({ bundle, binding: BINDING, intervalMs: options.intervalMs });
     threads.push(main);
-    const injectedMain = await inject({ cdp: main, collector, intervalMs: options.intervalMs, bundle, acking: acking.signal });
-    stderr.write(`xray: attached to pid ${pid} (node ${title}). ${options.durationMs === null ? 'Ctrl+C to detach.' : `Detaching in ${Math.round(options.durationMs / 1000)} s.`}\n`);
+    const injectedMain = await inject({ cdp: main, collector, code, acking: acking.signal });
+    stderr.write(`xray: attached to ${where} (node ${title}). ${options.durationMs === null ? 'Ctrl+C to detach.' : `Detaching in ${Math.round(options.durationMs / 1000)} s.`}\n`);
 
     // Worker threads: each one is its own session, tunnelled through the main thread's inspector.
     main.on('NodeWorker.attachedToWorker', (params) => {
@@ -220,7 +259,7 @@ export async function attachWith({ options, stderr, interrupts, edges }: AttachA
       threads.push(worker);
       workers.set(
         sessionId,
-        inject({ cdp: worker, collector, intervalMs: options.intervalMs, bundle, acking: acking.signal }).then(
+        inject({ cdp: worker, collector, code, acking: acking.signal }).then(
           (injected) => {
             stderr.write(`xray: + ${typeof name === 'string' ? name : 'worker'}\n`);
             return injected;
@@ -243,7 +282,7 @@ export async function attachWith({ options, stderr, interrupts, edges }: AttachA
     if (reason !== 'gone') await detach({ cdp: main, opened, threads });
     clean = true;
     for (const agent of injected) agent.link.closed();
-    stderr.write(reason === 'gone' ? `xray: pid ${pid} went away.\n` : `xray: detached from pid ${pid}${opened ? ', inspector closed' : ''}.\n`);
+    stderr.write(reason === 'gone' ? `xray: ${where} went away.\n` : `xray: detached from ${where}${opened ? ', inspector closed' : ''}.\n`);
 
     if (opening.dashboard !== null) {
       opening.dashboard.setStatus({ state: 'detached', command: label });
@@ -261,7 +300,7 @@ export async function attachWith({ options, stderr, interrupts, edges }: AttachA
       if (verified && cdp !== null) {
         await Promise.all(workers.values());
         await detach({ cdp, opened, threads });
-      } else if (opened) {
+      } else if (opened && pid !== null) {
         // Not (known to be) the target's inspector: only close what is verifiably the target's.
         await closeInspectorOf({ edges, pid, port: inspectPort });
         if (inspectPort !== DEFAULT_INSPECT_PORT) await closeInspectorOf({ edges, pid, port: DEFAULT_INSPECT_PORT });
@@ -276,8 +315,8 @@ interface InjectArgs {
   /** The main thread's session or a worker's. */
   readonly cdp: Cdp;
   readonly collector: Collector;
-  readonly intervalMs: number;
-  readonly bundle: string;
+  /** What the thread evaluates to load and start the agent. */
+  readonly code: string;
   /** Aborts when detaching starts. */
   readonly acking: AbortSignal;
 }
@@ -294,7 +333,7 @@ const unrefTimeout: Schedule = (callback, ms) => {
 };
 
 /** Puts the agent into one thread: binding for its messages, `require` of the bundle, start. */
-async function inject({ cdp, collector, intervalMs, bundle, acking }: InjectArgs): Promise<Injected> {
+async function inject({ cdp, collector, code, acking }: InjectArgs): Promise<Injected> {
   const link = collector.open({
     send: (command) => {
       evaluate(cdp, `${API}.command(${JSON.stringify(JSON.stringify(command))})`).catch(() => undefined);
@@ -326,7 +365,7 @@ async function inject({ cdp, collector, intervalMs, bundle, acking }: InjectArgs
   try {
     await cdp.send('Runtime.enable');
     await cdp.send('Runtime.addBinding', { name: BINDING });
-    await evaluate(cdp, injection({ bundle, binding: BINDING, intervalMs }), { commandLineApi: true });
+    await evaluate(cdp, code, { commandLineApi: true });
   } catch (error) {
     link.closed();
     throw error;

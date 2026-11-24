@@ -48,6 +48,13 @@ describe('parseArgs', () => {
     assert.deepEqual(parseArgs(['attach']), { kind: 'error', message: 'missing <pid> to attach to' });
     assert.deepEqual(parseArgs(['attach', 'node']), { kind: 'error', message: "'node' is not a process id" });
     assert.deepEqual(parseArgs(['attach', '42', 'extra']), { kind: 'error', message: "unexpected 'extra' after the pid" });
+    assert.deepEqual(parseArgs(['attach', '--remote', '19229', '--duration', '30s']), {
+      kind: 'attach',
+      options: { intervalMs: 1000, cpu: false, heap: false, fs: false, traceLoopMs: null, record: null, report: null, profiles: null, ui: null, budgets: [], pid: null, inspectPort: 19_229, durationMs: 30_000 },
+    });
+    assert.deepEqual(parseArgs(['attach', '--remote', '19229', '42']), { kind: 'error', message: "--remote attaches to a port, not a pid: unexpected '42'" });
+    assert.deepEqual(parseArgs(['attach', '--remote', 'x']), { kind: 'error', message: "--remote: 'x' is not a port" });
+    assert.deepEqual(parseArgs(['run', '--remote', '1', 'node']), { kind: 'error', message: '--remote is for attach' });
     assert.deepEqual(parseArgs(['run', '--duration', '5s', 'node']), { kind: 'error', message: '--duration is for attach' });
     assert.deepEqual(parseArgs(['run', '--inspect-port', '1', 'node']), { kind: 'error', message: '--inspect-port is for attach' });
   });
