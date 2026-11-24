@@ -91,11 +91,13 @@ export function untrackedType(resource: object): string {
 
 /**
  * What the trace sees from a busy application, in small: promise reactions (`await`), nextTicks,
- * and immediates (one loop iteration). Its immediates do not keep the process alive.
+ * and immediates (one loop iteration). The immediates are not unref'd: an unref'd one lets an idle loop
+ * sleep in poll until the next timer, which stretched the calibration to tens of seconds and let it
+ * overlap whatever ran after it.
  */
 async function calibrationWorkload(): Promise<void> {
   const immediates: Array<Promise<void>> = [];
-  for (let i = 0; i < CALIBRATION_IMMEDIATES; i++) immediates.push(new Promise<void>((resolve) => void setImmediate(resolve).unref()));
+  for (let i = 0; i < CALIBRATION_IMMEDIATES; i++) immediates.push(new Promise<void>((resolve) => void setImmediate(resolve)));
   for (let i = 0; i < CALIBRATION_AWAITS; i++) {
     await null;
     if (i % 4 === 0) await new Promise<void>((resolve) => process.nextTick(resolve));
