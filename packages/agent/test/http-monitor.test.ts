@@ -14,7 +14,7 @@ describe('HttpSideAggregator', () => {
     side.begin(c, { start: 0, method: 'POST', host: '', path: '/orders' });
     side.end(a, 12, { status: 200 });
     side.end(b, 30, { status: 503 });
-    side.end(c, 4, { status: 201, route: '/orders/:kind' });
+    side.end(c, 4, { status: 201, pattern: '/:kind', base: '/orders' });
     side.end(c, 9, { status: 200 });
     const tick = side.snapshot(40);
     assert.deepEqual([tick.started, tick.finished, tick.failed, tick.inFlight], [3, 3, 0, 0]);

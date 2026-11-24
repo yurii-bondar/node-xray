@@ -35,6 +35,15 @@ const report: SourceReport = {
       count: 3,
       worst: { kind: 'loop-stall', t: 31_000, delay: 900, gcPause: 0, cause: 'unknown' },
       culprit: { name: 'renderReport', url: 'file:///srv/app/report.js', line: 42, column: 3, self: 30, total: 30, selfShare: 0.6 },
+      culpritStack: {
+        frames: [
+          { name: 'emit', url: 'node:events', line: 517, column: 28 },
+          { name: 'handle', url: 'file:///srv/app/server.js', line: 12, column: 5 },
+          { name: 'renderReport', url: 'file:///srv/app/report.js', line: 42, column: 3 },
+        ],
+        self: 30,
+        share: 1,
+      },
     },
   ],
   hotFunctions: [{ name: 'renderReport', url: '/srv/app/report.js', line: 42, column: 3, self: 30, total: 30, selfShare: 0.6 }],
@@ -132,7 +141,7 @@ describe('formatReport', () => {
 
   it('explains findings and points at the code', () => {
     assert.match(text, /! loop-stall ×3, worst: event loop stalled 900 ms at \+30\.00 s \(synchronous code\)/);
-    assert.match(text, /likely in renderReport {2}report\.js:42 \(60\.0 % of CPU in that window\)/);
+    assert.match(text, /likely in renderReport {2}report\.js:42 \(60\.0 % of CPU in that window\)\n {8}← handle {2}server\.js:12\n {8}← emit {2}node:events:517/);
     assert.match(text, /60\.0 % {2}renderReport {2}report\.js:42/);
   });
 

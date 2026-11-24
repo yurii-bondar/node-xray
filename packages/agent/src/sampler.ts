@@ -2,7 +2,8 @@
 
 import { monitorEventLoopDelay, performance, PerformanceObserver, type IntervalHistogram, type PerformanceEntry } from 'node:perf_hooks';
 import v8 from 'node:v8';
-import type { LoopDelay, UvCounters, WireGcEvent, WireSample } from '@node-xray/core';
+import { isMainThread } from 'node:worker_threads';
+import type { CpuTimes, LoopDelay, UvCounters, WireGcEvent, WireSample } from '@node-xray/core';
 import type { SelfWork } from './self.js';
 import { systemMemory, type SwapReader } from './system.js';
 
@@ -25,6 +26,45 @@ export function uvCounters(): UvCounters | null {
   const loopCount: unknown = Reflect.get(info, 'loopCount');
   const events: unknown = Reflect.get(info, 'events');
   return typeof loopCount === 'number' && typeof events === 'number' ? { loopCount, events } : null;
+}
+
+const NO_LOOP_COUNT = (): number => -1;
+
+/**
+ * Reads `uvMetricsInfo.loopCount` for the loop tracer, which asks once per top-level callback:
+ * the feature check happens here, once, and a Node without it gets a constant.
+ */
+export function loopCountReader(): () => number {
+  if (uvCounters() === null) return NO_LOOP_COUNT;
+  const timing = performance.nodeTiming;
+  return () => {
+    const info: unknown = Reflect.get(timing, 'uvMetricsInfo');
+    const loopCount: unknown = typeof info === 'object' && info !== null ? Reflect.get(info, 'loopCount') : undefined;
+    return typeof loopCount === 'number' ? loopCount : -1;
+  };
+}
+
+/**
+ * CPU time of this thread. `process.cpuUsage()` is process-wide, so a worker thread would report
+ * the main thread's work as its own: workers use `process.threadCpuUsage()` (Node 22.19 / 23.9).
+ * A worker on an older Node has no per-thread CPU clock; it reports the time its event loop was
+ * active as user time instead (the closest per-thread figure: it includes time spent blocked in
+ * synchronous calls, and system time is 0).
+ */
+export function threadCpu(): CpuTimes {
+  if (isMainThread) return cpuTimes(process.cpuUsage());
+  const threadCpuUsage: unknown = Reflect.get(process, 'threadCpuUsage');
+  if (typeof threadCpuUsage === 'function') {
+    const usage: unknown = threadCpuUsage.call(process);
+    const user: unknown = typeof usage === 'object' && usage !== null ? Reflect.get(usage, 'user') : undefined;
+    const system: unknown = typeof usage === 'object' && usage !== null ? Reflect.get(usage, 'system') : undefined;
+    if (typeof user === 'number' && typeof system === 'number') return { user, system };
+  }
+  return { user: performance.eventLoopUtilization().active * 1000, system: 0 };
+}
+
+function cpuTimes(usage: NodeJS.CpuUsage): CpuTimes {
+  return { user: usage.user, system: usage.system };
 }
 
 function gcKindCode(entry: PerformanceEntry): number {
@@ -57,7 +97,6 @@ export class Sampler {
   #observer: PerformanceObserver | null = null;
   #timer: NodeJS.Timeout | null = null;
   #lastTick = performance.now();
-  #overheadUs = 0;
 
   constructor(private readonly deps: SamplerDeps) {}
 
@@ -86,11 +125,6 @@ export class Sampler {
     this.#histogram.disable();
   }
 
-  /** Main-thread time the agent spent outside the tick (profile serialisation, trace flushes). */
-  addOverhead(us: number): void {
-    this.#overheadUs += us;
-  }
-
   /** Collects and sends one sample now (also called once on process exit). */
   tick(): void {
     const started = performance.now();
@@ -99,11 +133,10 @@ export class Sampler {
     this.#histogram.reset();
     this.deps.swap.refresh();
     this.#lastTick = started;
-    this.#overheadUs = (performance.now() - started) * 1000;
   }
 
   #collect(now: number): WireSample {
-    const cpu = process.cpuUsage();
+    const cpu = threadCpu();
     const elu = performance.eventLoopUtilization();
     const memory = process.memoryUsage();
     const heap = v8.getHeapStatistics();
@@ -152,7 +185,8 @@ export class Sampler {
         fsWrites: rusage.fsWrite,
       },
       system: systemMemory(this.deps.swap),
-      overheadUs: this.#overheadUs,
+      // Everything the agent did since the last sample; this tick's own time counts in the next.
+      overheadUs: this.deps.self.takeOverhead(),
     };
   }
 }

@@ -76,7 +76,19 @@ describe('parseStreamMessage', () => {
   it('rejects a trace with a broken layout or dictionary index', () => {
     const base = { type: 'loop-trace', start: 0, end: 1, types: ['Timeout'], names: [], counters: [], dropped: 0 };
     assert.match(error({ ...base, events: [0, 1, 2] }), /multiple of 6/);
-    assert.match(error({ ...base, events: [3, 0, 0, 0, 0, -1] }), /index into a dictionary of 1/);
+    assert.equal(error({ ...base, events: [0, 0, 0, 0, 0, -1, 3, 0, 0, 0, 0, -1] }), '$.events[6]: expected index into a dictionary of 1');
+    assert.equal(error({ ...base, events: [0, 0, 0, 0, 0, 2] }), '$.events[0]: expected index into a dictionary of 0');
+  });
+
+  it('names the bad element of a list, also in nested lists', () => {
+    const frame = { functionName: 'f', scriptId: '1', url: '', lineNumber: 0, columnNumber: 0 };
+    const node = (id: number, extra: object = {}): object => ({ id, callFrame: frame, hitCount: 0, children: [], ...extra });
+    const cpu = (nodes: object[]): unknown => ({ type: 'cpu-profile', start: 0, end: 1, profile: { nodes, startTime: 0, endTime: 1, samples: [] } });
+    assert.equal(error(cpu([node(1), node(2, { callFrame: { ...frame, url: 7 } })])), '$.profile.nodes[1].callFrame.url: expected string');
+    assert.equal(error(cpu([node(1, { positionTicks: [{ line: 1, ticks: 1 }, { line: 'x', ticks: 1 }] })])), '$.profile.nodes[0].positionTicks[1].line: expected finite number');
+    assert.equal(error(cpu([node(1, { children: [2, null] })])), '$.profile.nodes[0].children[1]: expected finite number');
+    const head = { callFrame: frame, selfSize: 1, children: [{ callFrame: frame, selfSize: 1, children: [] }, { callFrame: frame, selfSize: 1, children: [{ callFrame: frame, children: [] }] }] };
+    assert.equal(error({ type: 'heap-profile', start: 0, end: 1, profile: { head } }), '$.profile.head.children[1].children[0].selfSize: expected finite number');
   });
 
   it('parses a host sample with and without swap', () => {

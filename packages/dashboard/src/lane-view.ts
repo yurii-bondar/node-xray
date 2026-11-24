@@ -2,7 +2,7 @@
 
 import { CATEGORY_LABEL, formatMs, TASK_CATEGORIES, type Iteration, type TaskCategory } from '@node-xray/core';
 import { cssVar, fitCanvas, showTip } from './dom.js';
-import { hitTest, LANE_ROWS, layoutLane, type LaneBlock, type LaneLayout, type LaneLayoutArgs, type LaneRow } from './lane-layout.js';
+import { hitTest, LANE_ROWS, layoutLane, stepIteration, type LaneBlock, type LaneLayout, type LaneLayoutArgs, type LaneRow } from './lane-layout.js';
 
 const GUTTER = 92;
 const TOP = 22;
@@ -58,13 +58,23 @@ function niceStep(spanMs: number): number {
 export class LaneView {
   #layout: LaneLayout | null = null;
   #rowHeight = 0;
+  /** Where the mouse is over the canvas (CSS px), so a redraw can refresh the tooltip under it. */
+  #mouse: { readonly x: number; readonly y: number } | null = null;
 
   constructor(
     private readonly canvas: HTMLCanvasElement,
     private readonly tip: HTMLElement,
   ) {
-    canvas.addEventListener('mousemove', (event) => this.#hover(event));
-    canvas.addEventListener('mouseleave', () => (this.tip.hidden = true));
+    canvas.setAttribute('role', 'img');
+    canvas.addEventListener('mousemove', (event) => {
+      const rect = canvas.getBoundingClientRect();
+      this.#mouse = { x: event.clientX - rect.left, y: event.clientY - rect.top };
+      this.#hover();
+    });
+    canvas.addEventListener('mouseleave', () => {
+      this.#mouse = null;
+      this.tip.hidden = true;
+    });
   }
 
   render(args: Omit<LaneLayoutArgs, 'width'>): void {
@@ -74,6 +84,9 @@ export class LaneView {
     const plotWidth = Math.max(10, width - GUTTER);
     const layout = layoutLane({ ...args, width: plotWidth });
     this.#layout = layout;
+    let callbacks = 0;
+    for (const block of layout.blocks) if (block.item.kind === 'callback') callbacks += 1 + block.merged;
+    this.canvas.setAttribute('aria-label', `Event loop lane: ${callbacks} callbacks and ${layout.marks.length} iterations in the last ${formatMs(args.spanMs)}`);
     this.#rowHeight = (height - TOP - BOTTOM) / LANE_ROWS.length;
 
     ctx.clearRect(0, 0, width, height);
@@ -134,14 +147,18 @@ export class LaneView {
       ctx.fillText(ago === 0 ? 'now' : `−${formatMs(ago)}`, Math.min(Math.max(x, GUTTER + 20), width - 20), height - BOTTOM / 2 + 2);
     }
     ctx.textAlign = 'start';
+    // The blocks moved under a still mouse: say what is there now.
+    this.#hover();
   }
 
-  #hover(event: MouseEvent): void {
+  #hover(): void {
     const layout = this.#layout;
-    if (layout === null || this.#rowHeight <= 0) return;
-    const rect = this.canvas.getBoundingClientRect();
-    const x = event.clientX - rect.left;
-    const y = event.clientY - rect.top;
+    const mouse = this.#mouse;
+    if (layout === null || mouse === null || this.#rowHeight <= 0) {
+      this.tip.hidden = true;
+      return;
+    }
+    const { x, y } = mouse;
     const row = LANE_ROWS[Math.floor((y - TOP) / this.#rowHeight)];
     const block = row === undefined || x < GUTTER ? null : hitTest(layout, row, x - GUTTER);
     if (block === null) {
@@ -154,15 +171,33 @@ export class LaneView {
 
 const BAR = 7;
 const GAP = 2;
+/** Iterations a key moves the selection by (older is left). */
+const KEY_STEPS: ReadonlyMap<string, number> = new Map([
+  ['ArrowLeft', -1],
+  ['ArrowRight', 1],
+  ['Home', Number.NEGATIVE_INFINITY],
+  ['End', Number.POSITIVE_INFINITY],
+]);
 
-/** Last iterations as stacked bars (counts per category); click selects one. */
+/** Last iterations as stacked bars (counts per category); a click or the arrow keys select one. */
 export class IterationStrip {
   #shown: Iteration[] = [];
+  #iterations: readonly Iteration[] = [];
+  #selected: number | null = null;
 
   constructor(
     private readonly canvas: HTMLCanvasElement,
     onSelect: (iteration: Iteration) => void,
   ) {
+    canvas.tabIndex = 0;
+    canvas.setAttribute('role', 'img');
+    canvas.addEventListener('keydown', (event) => {
+      const delta = KEY_STEPS.get(event.key);
+      if (delta === undefined) return;
+      event.preventDefault();
+      const next = stepIteration(this.#iterations, this.#selected, delta);
+      if (next !== undefined) onSelect(next);
+    });
     canvas.addEventListener('click', (event) => {
       const rect = canvas.getBoundingClientRect();
       const fromRight = rect.right - event.clientX;
@@ -173,6 +208,13 @@ export class IterationStrip {
   }
 
   render(iterations: readonly Iteration[], selected: number | null): void {
+    this.#iterations = iterations;
+    this.#selected = selected;
+    const current = iterations.find((it) => it.index === selected) ?? iterations[iterations.length - 1];
+    this.canvas.setAttribute(
+      'aria-label',
+      `Loop iterations, ${iterations.length} traced${current === undefined ? '' : `; selected #${current.index}: ${iterationSummary(current) || 'nothing traced'}, busy ${formatMs(current.busy)}`}. Left and right arrows select an older or newer one.`,
+    );
     const ctx = fitCanvas(this.canvas);
     const width = this.canvas.clientWidth;
     const height = this.canvas.clientHeight;

@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import type { CpuProfile } from '../src/cdp.js';
+import { cpuFlame, hotFunctions, withoutScript } from '../src/flame.js';
 import { LineTicks } from '../src/lines.js';
 import { Timeline } from '../src/timeline.js';
 import { callFrame, hello } from './fixtures.js';
@@ -32,6 +33,26 @@ describe('LineTicks', () => {
       [11, 12],
       [12, 4],
     ]);
+  });
+
+  it('leaves out what the agent called and counts samples when hit counts are missing, as the flame graph does', () => {
+    const nested: CpuProfile = {
+      startTime: 0,
+      endTime: 1,
+      samples: [3, 3, 4, 5, 5, 5],
+      nodes: [
+        { id: 1, callFrame: callFrame('(root)'), hitCount: 0, children: [2, 3], positionTicks: [] },
+        { id: 2, callFrame: callFrame('flush', 3, 'file:///opt/xray/agent.cjs'), hitCount: 0, children: [5], positionTicks: [] },
+        { id: 3, callFrame: callFrame('render', 9), hitCount: 0, children: [4], positionTicks: [] },
+        { id: 4, callFrame: callFrame('format', 20), hitCount: 0, children: [], positionTicks: [] },
+        { id: 5, callFrame: callFrame('stringify', 30, 'node:internal/json'), hitCount: 0, children: [], positionTicks: [] },
+      ],
+    };
+    const lines = new LineTicks();
+    lines.add(nested, agent);
+    const tree = withoutScript(cpuFlame(nested, { start: 0, end: 1 }), agent);
+    assert.equal(lines.snapshot().work, 3, 'render 2 + format 1; stringify ran for the agent');
+    assert.equal(lines.snapshot().work, hotFunctions(tree, 10).reduce((sum, f) => sum + f.self, 0));
   });
 
   it('is fed by the timeline from CPU windows', () => {

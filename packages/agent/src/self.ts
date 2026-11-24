@@ -1,8 +1,13 @@
 // The agent lives in someone else's process. Everything it runs goes through `SelfWork.run`:
-// errors never reach user code, and the loop tracer can tell the agent's own async work apart.
+// errors never reach user code, the loop tracer can tell the agent's own async work apart, and
+// the time it takes is the agent's overhead.
+
+import { performance } from 'node:perf_hooks';
 
 export class SelfWork {
   #depth = 0;
+  #overheadUs = 0;
+  #spentUs = 0;
   /** Timers and other handles the agent created; the tracer skips their callbacks. */
   readonly resources = new WeakSet<object>();
 
@@ -14,6 +19,8 @@ export class SelfWork {
   }
 
   run(work: () => void): void {
+    const outermost = this.#depth === 0;
+    const started = outermost ? performance.now() : 0;
     this.#depth++;
     try {
       work();
@@ -21,7 +28,26 @@ export class SelfWork {
       this.#report(error);
     } finally {
       this.#depth--;
+      if (outermost) this.addOverhead((performance.now() - started) * 1000);
     }
+  }
+
+  /** All the agent's time so far, µs; never reset. The tracer takes it out of the callbacks it ran in. */
+  get spentUs(): number {
+    return this.#spentUs;
+  }
+
+  /** Main-thread time the agent spent outside `run`: async steps, hooks, wrappers, subscribers. */
+  addOverhead(us: number): void {
+    this.#overheadUs += us;
+    this.#spentUs += us;
+  }
+
+  /** Overhead since the last call, µs. */
+  takeOverhead(): number {
+    const us = this.#overheadUs;
+    this.#overheadUs = 0;
+    return us;
   }
 
   /** Marks a handle as the agent's own and returns it. */

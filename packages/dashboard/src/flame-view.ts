@@ -3,12 +3,14 @@
 
 import { formatShare, type DiffNode, type FlameFrame, type FlameNode } from '@node-xray/core';
 import { cssVar, fitCanvas, showTip, withAlpha } from './dom.js';
-import { frameKind, hitFlame, layoutFlame, type FlameRect, type FrameKind } from './flame-layout.js';
+import { findByPath, frameKind, hitFlame, layoutFlame, stackAlong, type FlameRect, type FrameKind } from './flame-layout.js';
 
 const ROW = 18;
 const MAX_ROWS = 40;
 /** A change of this many share points of work is drawn at full strength. */
 const FULL_CHANGE = 0.1;
+/** Callers listed in the tooltip, nearest first; the stack panel has the rest. */
+const TIP_CALLERS = 4;
 
 const KIND_COLOR: Readonly<Record<FrameKind, string>> = { app: '--f-app', deps: '--f-deps', node: '--f-node', native: '--f-native' };
 
@@ -38,9 +40,18 @@ export interface FlameViewArgs {
   readonly onOpen: ((frame: FlameFrame) => void) | null;
 }
 
+export interface FlameScene {
+  /** The whole profile: shares and callers are of it, also when zoomed. */
+  readonly root: FlameNode;
+  /** Node keys from `root` to the zoomed frame ([] = not zoomed); the zoomed frame is drawn as the top. */
+  readonly path: readonly string[];
+}
+
 export class FlameView {
   #rects: FlameRect[] = [];
-  #root: FlameNode | null = null;
+  #scene: FlameScene | null = null;
+  /** Where the mouse is over the canvas (CSS px), so a redraw can refresh the tooltip under it. */
+  #mouse: { readonly x: number; readonly y: number } | null = null;
   readonly #canvas: HTMLCanvasElement;
   readonly #tip: HTMLElement;
   readonly #locate: (frame: FlameFrame) => string;
@@ -49,8 +60,16 @@ export class FlameView {
     this.#canvas = canvas;
     this.#tip = tip;
     this.#locate = locate;
-    canvas.addEventListener('mousemove', (event) => this.#hover(event));
-    canvas.addEventListener('mouseleave', () => (tip.hidden = true));
+    canvas.setAttribute('role', 'img');
+    canvas.addEventListener('mousemove', (event) => {
+      const bounds = canvas.getBoundingClientRect();
+      this.#mouse = { x: event.clientX - bounds.left, y: event.clientY - bounds.top };
+      this.#hover();
+    });
+    canvas.addEventListener('mouseleave', () => {
+      this.#mouse = null;
+      tip.hidden = true;
+    });
     canvas.addEventListener('click', (event) => {
       const rect = this.#at(event);
       if (rect === null) return;
@@ -64,8 +83,11 @@ export class FlameView {
     }
   }
 
-  render(root: FlameNode): void {
-    this.#root = root;
+  render(scene: FlameScene): void {
+    this.#scene = scene;
+    const root = findByPath(scene.root, scene.path) ?? scene.root;
+    const share = scene.root.total > 0 && !isDiff(root) ? ` · ${formatShare(root.total / scene.root.total)} of the profile` : '';
+    this.#canvas.setAttribute('aria-label', `CPU flame graph${scene.path.length === 0 ? '' : `, zoomed into ${root.name}${share}`}: use the hot functions table for the same data as text`);
     const width = this.#canvas.clientWidth;
     this.#rects = layoutFlame(root, width);
     let depth = 0;
@@ -100,26 +122,36 @@ export class FlameView {
         ctx.fillText(node.name, rect.x + 4, y + ROW / 2, rect.w - 8);
       }
     }
+    // The frames moved under a still mouse: say what is there now.
+    this.#hover();
   }
 
   #at(event: MouseEvent): FlameRect | null {
     const bounds = this.#canvas.getBoundingClientRect();
-    return hitFlame(this.#rects, event.clientX - bounds.left, Math.floor((event.clientY - bounds.top) / ROW));
+    return this.#hit(event.clientX - bounds.left, event.clientY - bounds.top);
   }
 
-  #hover(event: MouseEvent): void {
-    const rect = this.#at(event);
-    const root = this.#root;
-    if (rect === null || root === null || root.total <= 0) {
+  #hit(x: number, y: number): FlameRect | null {
+    return hitFlame(this.#rects, x, Math.floor(y / ROW));
+  }
+
+  #hover(): void {
+    const mouse = this.#mouse;
+    const scene = this.#scene;
+    const rect = mouse === null || scene === null ? null : this.#hit(mouse.x, mouse.y);
+    if (mouse === null || scene === null || rect === null || scene.root.total <= 0) {
       this.#tip.hidden = true;
       return;
     }
+    const root = scene.root;
     const node = rect.node;
     const where = this.#locate(node);
     const weights = isDiff(node)
       ? `now ${formatShare(node.total)} · baseline ${formatShare(node.baseTotal)} (${points(node.total - node.baseTotal)})\nself now ${formatShare(node.self)} · baseline ${formatShare(node.baseSelf)}`
       : `total ${formatShare(node.total / root.total)} · self ${formatShare(node.self / root.total)}`;
-    const bounds = this.#canvas.getBoundingClientRect();
-    showTip(this.#tip, `${node.name}${where === '' ? '' : `\n${where}`}\n${weights}`, event.clientX - bounds.left, event.clientY - bounds.top);
+    // Callers up to the real root, not only to the zoomed frame.
+    const callers = stackAlong(root, [...scene.path, ...rect.path]).slice(0, -1).reverse();
+    const chain = callers.slice(0, TIP_CALLERS).map((caller) => `\n← ${caller.name}`).join('') + (callers.length > TIP_CALLERS ? `\n← … ${callers.length - TIP_CALLERS} more` : '');
+    showTip(this.#tip, `${node.name}${where === '' ? '' : `\n${where}`}\n${weights}${chain}`, mouse.x, mouse.y);
   }
 }

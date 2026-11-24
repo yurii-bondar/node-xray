@@ -2,7 +2,7 @@
 
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { after, before, describe, it } from 'node:test';
@@ -22,9 +22,9 @@ interface Result {
   readonly stderr: string;
 }
 
-function xray(args: readonly string[]): Promise<Result> {
+function xray(args: readonly string[], env: NodeJS.ProcessEnv = process.env): Promise<Result> {
   return new Promise((resolve) => {
-    const child = spawn(process.execPath, [bin, ...args], { cwd: dir, stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(process.execPath, [bin, ...args], { cwd: dir, stdio: ['ignore', 'pipe', 'pipe'], env });
     let stdout = '';
     let stderr = '';
     child.stdout.setEncoding('utf8').on('data', (c: string) => (stdout += c));
@@ -65,6 +65,28 @@ describe('xray run', () => {
     assert.ok(lines.length > 10);
     assert.ok(lines.every((line) => line.startsWith('{"c":')));
     assert.ok(typeof first === 'object' && first !== null && 'm' in first);
+    assert.ok(lines.some((line) => /^\{"c":\d+,"closed":true\}$/.test(line)), 'the end of the connection is recorded');
+  });
+
+  it('fails cleanly, before starting the command, when the recording cannot be written', async () => {
+    const marker = path.join(dir, 'started');
+    const result = await xray(['run', '--record', path.join(dir, 'missing', 'r.xray.jsonl'), '--', process.execPath, '-e', `require('fs').writeFileSync(${JSON.stringify(marker)}, '')`]);
+    assert.equal(result.code, 1);
+    assert.match(result.stderr, /^xray: cannot write the recording .*missing.*ENOENT/m);
+    assert.doesNotMatch(result.stderr, /at .*\.js:\d+/, 'no stack trace');
+    assert.equal(existsSync(marker), false, 'the command never ran');
+  });
+
+  it('keeps the dashboard token and host out of the command', async () => {
+    const program = "console.log(JSON.stringify([process.env.XRAY_DASHBOARD_TOKEN ?? null, process.env.XRAY_DASHBOARD_HOST ?? null, typeof process.env.XRAY_SOCKET]))";
+    const result = await xray(['run', '--', process.execPath, '-e', program], { ...process.env, XRAY_DASHBOARD_TOKEN: 'secret-token-0123456789', XRAY_DASHBOARD_HOST: 'x.dev' });
+    assert.equal(result.stdout, '[null,null,"string"]\n', result.stderr);
+  });
+
+  it('refuses a malformed XRAY_DASHBOARD_HOST with --ui', async () => {
+    const result = await xray(['run', '--ui', '--', process.execPath, '-e', ''], { ...process.env, XRAY_DASHBOARD_HOST: '*.app.github.dev' });
+    assert.equal(result.code, 1);
+    assert.match(result.stderr, /XRAY_DASHBOARD_HOST: expected one host name or host:port/);
   });
 
   it('reports a command that cannot start', async () => {
@@ -141,6 +163,18 @@ describe('budgets and replay', () => {
     const program = 'setTimeout(() => { const e = Date.now() + 300; while (Date.now() < e); }, 400); setTimeout(() => {}, 900)';
     const result = await xray(['run', '--interval', '100ms', '--budget', 'loop.max<1ms', '--', process.execPath, '-e', program]);
     assert.equal(result.code, 1);
+  });
+
+  it('replays closed records and counts malformed host records as skipped', async () => {
+    const recording = path.join(dir, 'closed.xray.jsonl');
+    const run = await xray(['run', '--interval', '100ms', '--record', recording, '--', process.execPath, '-e', 'setTimeout(() => {}, 400)']);
+    assert.equal(run.code, 0, run.stderr);
+    writeFileSync(recording, `${readFileSync(recording, 'utf8')}{"c":0,"m":{not json}\n{"c":0,"m":{"type":"nope"}}\n`);
+    const replayed = await xray(['replay', recording]);
+    assert.equal(replayed.code, 0, replayed.stderr);
+    assert.match(replayed.stderr, /\(2 lines skipped\)/);
+    assert.match(replayed.stderr, /── node {2}\(pid \d+/);
+    assert.doesNotMatch(replayed.stderr, /SyntaxError/);
   });
 
   it('refuses a file that is not a recording', async () => {

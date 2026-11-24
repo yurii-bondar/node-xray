@@ -13,6 +13,8 @@ export interface AttachOptions {
 export interface AttachApi {
   start(options: AttachOptions): void;
   command(json: string): void;
+  /** The CLI received this many payload characters from the agent since `start` (cumulative). */
+  ack(chars: number): void;
   stop(): void;
 }
 
@@ -27,20 +29,26 @@ function install(): void {
   }
   let agent: AgentHandle | null = null;
   let deliver: (json: string) => void = () => undefined;
+  let ack: (chars: number) => void = () => undefined;
   const api: AttachApi = {
     start({ binding, intervalMs }) {
       agent?.stop();
       const link = bindingLink(binding);
       deliver = (json) => link.deliver(json);
+      ack = (chars) => link.ack(chars);
       agent = startAgent({ link: link.link, intervalMs, agentScript: typeof __filename === 'string' ? __filename : '' });
     },
     command(json) {
       deliver(json);
     },
+    ack(chars) {
+      ack(chars);
+    },
     stop() {
       agent?.stop();
       agent = null;
       deliver = () => undefined;
+      ack = () => undefined;
     },
   };
   Reflect.set(globalThis, KEY, api);

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import type { CpuProfile, HeapProfile } from '../src/cdp.js';
-import { allocationFlame, cpuFlame, hotFunctions, mergeFlames, scriptPath, withoutScript, type FlameNode } from '../src/flame.js';
+import { allocationFlame, cpuFlame, FlameSum, hotFunctions, mergeFlames, scriptPath, stacksOf, withoutScript, type FlameNode } from '../src/flame.js';
 import { callFrame } from './fixtures.js';
 
 const window = { start: 0, end: 5000 };
@@ -116,6 +116,19 @@ describe('mergeFlames / hotFunctions', () => {
     assert.equal(mergeFlames([]), null);
   });
 
+  it('keeps a running sum, finished only when read and reused until the next add', () => {
+    const sum = new FlameSum();
+    assert.equal(sum.tree(), null);
+    sum.add(cpuFlame(profile, { start: 5000, end: 10_000 }));
+    const first = sum.tree();
+    assert.equal(sum.tree(), first);
+    sum.add(cpuFlame(profile, { start: 0, end: 5000 }));
+    const second = sum.tree();
+    assert.notEqual(second, first);
+    assert.equal(first?.root.total, 15, 'an earlier snapshot does not change');
+    assert.deepEqual(second, mergeFlames([cpuFlame(profile, { start: 0, end: 5000 }), cpuFlame(profile, { start: 5000, end: 10_000 })]));
+  });
+
   it('refuses to mix samples with bytes', () => {
     const heap = allocationFlame({ head: { callFrame: callFrame('(root)'), selfSize: 1, children: [] } }, window);
     assert.throws(() => mergeFlames([cpuFlame(profile, window), heap]), /cannot merge/);
@@ -153,5 +166,46 @@ describe('mergeFlames / hotFunctions', () => {
       ],
     };
     assert.deepEqual(hotFunctions(cpuFlame(idle, window), 5).map((f) => [f.name, f.selfShare]), [['work', 1]]);
+  });
+});
+
+describe('stacksOf', () => {
+  // (root) → server → render → stringify (30)
+  //        → cron → stringify (10)
+  //        → stringify itself, no self: only a caller of others
+  const shared: CpuProfile = {
+    ...profile,
+    nodes: [
+      { id: 1, callFrame: callFrame('(root)'), hitCount: 0, children: [2, 5], positionTicks: [] },
+      { id: 2, callFrame: callFrame('server', 1), hitCount: 0, children: [3], positionTicks: [] },
+      { id: 3, callFrame: callFrame('render', 20), hitCount: 2, children: [4], positionTicks: [] },
+      { id: 4, callFrame: callFrame('stringify', 40), hitCount: 30, children: [], positionTicks: [] },
+      { id: 5, callFrame: callFrame('cron', 60), hitCount: 0, children: [6], positionTicks: [] },
+      { id: 6, callFrame: callFrame('stringify', 40), hitCount: 10, children: [], positionTicks: [] },
+    ],
+  };
+
+  it('lists the paths into a function, outermost caller first, heaviest first', () => {
+    const tree = cpuFlame(shared, window);
+    const fn = hotFunctions(tree, 1)[0];
+    assert.ok(fn);
+    const stacks = stacksOf(tree, fn, 5);
+    assert.deepEqual(
+      stacks.map((s) => [s.frames.map((f) => f.name), s.self, s.share]),
+      [
+        [['server', 'render', 'stringify'], 30, 0.75],
+        [['cron', 'stringify'], 10, 0.25],
+      ],
+    );
+    assert.equal(stacks[0]?.frames[1]?.line, 21, 'frames keep their positions');
+    assert.equal(stacksOf(tree, fn, 1).length, 1);
+  });
+
+  it('skips paths where the function did no work itself, and unknown functions', () => {
+    const tree = cpuFlame(shared, window);
+    const server = tree.root.children[0];
+    assert.ok(server);
+    assert.deepEqual(stacksOf(tree, server, 5), []);
+    assert.deepEqual(stacksOf(tree, { name: 'nope', url: '', line: 0, column: 0 }, 5), []);
   });
 });

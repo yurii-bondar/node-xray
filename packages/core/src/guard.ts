@@ -1,10 +1,19 @@
 // Narrowing of untyped input (agent messages, CDP payloads). Readers throw `ProtocolError`
 // with the path of the first bad field; `parseWith` turns that into a `Parsed` result.
+// Paths are built only when something is wrong: valid input allocates none per element.
 
 export class ProtocolError extends Error {
-  constructor(readonly path: string, expected: string) {
+  constructor(
+    readonly path: string,
+    readonly expected: string,
+  ) {
     super(`${path}: expected ${expected}`);
     this.name = 'ProtocolError';
+  }
+
+  /** The same error inside element `index` of the list at `listPath`, which `path` starts with. */
+  inElement(listPath: string, index: number): ProtocolError {
+    return new ProtocolError(`${listPath}[${index}]${this.path.slice(listPath.length)}`, this.expected);
   }
 }
 
@@ -27,8 +36,12 @@ function isRecord(value: unknown): value is Json {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value);
+}
+
 export function readNumber(value: unknown, path: string): number {
-  if (typeof value !== 'number' || !Number.isFinite(value)) throw new ProtocolError(path, 'finite number');
+  if (!isFiniteNumber(value)) throw new ProtocolError(path, 'finite number');
   return value;
 }
 
@@ -37,10 +50,21 @@ export function readString(value: unknown, path: string): string {
   return value;
 }
 
+/**
+ * `item` gets the list's own path, not one per element: the index is put into the path when an
+ * element's error passes through here (`$.nodes[3].id`).
+ */
 export function readList<T>(value: unknown, path: string, item: (value: unknown, path: string) => T): T[] {
   if (!Array.isArray(value)) throw new ProtocolError(path, 'array');
   const out: T[] = new Array<T>(value.length);
-  for (let i = 0; i < value.length; i++) out[i] = item(value[i], `${path}[${i}]`);
+  for (let i = 0; i < value.length; i++) {
+    try {
+      out[i] = item(value[i], path);
+    } catch (error) {
+      if (error instanceof ProtocolError && error.path.startsWith(path)) throw error.inElement(path, i);
+      throw error;
+    }
+  }
   return out;
 }
 
@@ -58,7 +82,8 @@ export class Fields {
   }
 
   number(key: string): number {
-    return readNumber(this.obj[key], this.at(key));
+    const value = this.obj[key];
+    return isFiniteNumber(value) ? value : readNumber(value, this.at(key));
   }
 
   /** A field that older agents or some CDP versions omit. */
@@ -73,7 +98,8 @@ export class Fields {
   }
 
   string(key: string): string {
-    return readString(this.obj[key], this.at(key));
+    const value = this.obj[key];
+    return typeof value === 'string' ? value : readString(value, this.at(key));
   }
 
   boolean(key: string): boolean {

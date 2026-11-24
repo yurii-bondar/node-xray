@@ -88,7 +88,15 @@ export interface Window {
   readonly end: number;
 }
 
-export function cpuFlame(profile: CpuProfile, window: Window): FlameTree {
+export interface ProfileIndex {
+  readonly byId: ReadonlyMap<number, CpuProfileNode>;
+  /** The node no other node lists as a child; undefined for an empty profile. */
+  readonly root: CpuProfileNode | undefined;
+  /** Samples per node id. */
+  readonly hits: ReadonlyMap<number, number>;
+}
+
+export function indexProfile(profile: CpuProfile): ProfileIndex {
   const byId = new Map<number, CpuProfileNode>();
   const referenced = new Set<number>();
   for (const node of profile.nodes) {
@@ -107,7 +115,11 @@ export function cpuFlame(profile: CpuProfile, window: Window): FlameTree {
     for (const id of profile.samples) hits.set(id, (hits.get(id) ?? 0) + 1);
   }
 
-  const rootNode = profile.nodes.find((node) => !referenced.has(node.id));
+  return { byId, root: profile.nodes.find((node) => !referenced.has(node.id)), hits };
+}
+
+export function cpuFlame(profile: CpuProfile, window: Window): FlameTree {
+  const { byId, root: rootNode, hits } = indexProfile(profile);
   const root = draft(rootNode ? toFrame(rootNode.callFrame) : { name: '(root)', url: '', line: 0, column: 0 });
   if (rootNode) {
     root.self = hits.get(rootNode.id) ?? 0;
@@ -146,20 +158,38 @@ function addInto(target: Draft, source: FlameNode): void {
   for (const c of source.children) addInto(child(target, frameOf(c)), c);
 }
 
+/**
+ * Running sum of trees of one unit (every CPU window of a run). Adding costs the size of the added
+ * tree; the sum is finished into a tree only when read, and kept until the next add.
+ */
+export class FlameSum {
+  #sum: { root: Draft; unit: FlameUnit; start: number; end: number } | null = null;
+  #tree: FlameTree | null = null;
+
+  add(tree: FlameTree): void {
+    if (this.#sum === null) this.#sum = { root: draft(frameOf(tree.root)), unit: tree.unit, start: tree.start, end: tree.end };
+    const sum = this.#sum;
+    if (tree.unit !== sum.unit) throw new Error(`cannot merge ${tree.unit} into ${sum.unit}`);
+    addInto(sum.root, tree.root);
+    sum.start = Math.min(sum.start, tree.start);
+    sum.end = Math.max(sum.end, tree.end);
+    this.#tree = null;
+  }
+
+  /** `null` until a tree was added. */
+  tree(): FlameTree | null {
+    const sum = this.#sum;
+    if (sum === null) return null;
+    this.#tree ??= { unit: sum.unit, root: finish(sum.root), start: sum.start, end: sum.end };
+    return this.#tree;
+  }
+}
+
 /** Sum of trees of one unit (the last N CPU windows → "last 30 s"). `null` for an empty list. */
 export function mergeFlames(trees: readonly FlameTree[]): FlameTree | null {
-  const first = trees[0];
-  if (first === undefined) return null;
-  const root = draft(frameOf(first.root));
-  let start = first.start;
-  let end = first.end;
-  for (const tree of trees) {
-    if (tree.unit !== first.unit) throw new Error(`cannot merge ${tree.unit} into ${first.unit}`);
-    addInto(root, tree.root);
-    start = Math.min(start, tree.start);
-    end = Math.max(end, tree.end);
-  }
-  return { unit: first.unit, root: finish(root), start, end };
+  const sum = new FlameSum();
+  for (const tree of trees) sum.add(tree);
+  return sum.tree();
 }
 
 /**
@@ -202,7 +232,7 @@ export function withoutScript(tree: FlameTree, url: string): FlameTree {
 }
 
 /** V8 pseudo-frames that are not work: excluded from hot lists and from their shares. */
-const NOT_WORK: ReadonlySet<string> = new Set(['(root)', '(idle)', '(program)']);
+export const NOT_WORK: ReadonlySet<string> = new Set(['(root)', '(idle)', '(program)']);
 
 export interface HotFunction extends FlameFrame {
   readonly self: number;
@@ -242,4 +272,34 @@ export function hotFunctions(tree: FlameTree, limit: number): HotFunction[] {
   }
   out.sort((a, b) => b.self - a.self);
   return out.slice(0, limit);
+}
+
+/** One way the program reached a function, and how much of the function's own weight came this way. */
+export interface CallStack {
+  /** Outermost caller first, the function last; V8's '(root)' left out. */
+  readonly frames: readonly FlameFrame[];
+  /** The function's self weight on this path. */
+  readonly self: number;
+  /** self / the function's self over all its paths, 0..1. */
+  readonly share: number;
+}
+
+/** The call paths that end in `fn` and carry its self weight, heaviest first. */
+export function stacksOf(tree: FlameTree, fn: FlameFrame, limit: number): CallStack[] {
+  const key = frameKey(fn);
+  const found: Array<{ frames: FlameFrame[]; self: number }> = [];
+  const path: FlameFrame[] = [];
+  const visit = (node: FlameNode): void => {
+    path.push(frameOf(node));
+    if (node.self > 0 && frameKey(node) === key) found.push({ frames: path.slice(1), self: node.self });
+    for (const c of node.children) visit(c);
+    path.pop();
+  };
+  visit(tree.root);
+  let all = 0;
+  for (const stack of found) all += stack.self;
+  return found
+    .sort((a, b) => b.self - a.self)
+    .slice(0, limit)
+    .map((stack) => ({ frames: stack.frames, self: stack.self, share: all > 0 ? stack.self / all : 0 }));
 }

@@ -39,13 +39,21 @@ export function layoutFlame(root: FlameNode, width: number, minWidth = 0.5): Fla
 
 /** Follows `path` (from `nodeKey`) down from `root`; null when the tree no longer has it. */
 export function findByPath(root: FlameNode, path: readonly string[]): FlameNode | null {
+  const nodes = stackAlong(root, path);
+  return nodes.length < path.length ? null : (nodes[nodes.length - 1] ?? root);
+}
+
+/** The nodes `path` passes through below `root`, outermost first; stops where the tree no longer has it. */
+export function stackAlong(root: FlameNode, path: readonly string[]): FlameNode[] {
+  const out: FlameNode[] = [];
   let node: FlameNode = root;
   for (const key of path) {
     const next = node.children.find((child) => nodeKey(child) === key);
-    if (next === undefined) return null;
+    if (next === undefined) break;
+    out.push(next);
     node = next;
   }
-  return node;
+  return out;
 }
 
 export type FrameKind = 'app' | 'deps' | 'node' | 'native';

@@ -1,27 +1,18 @@
 // Summary of a run: what a person reads after `xray run` exits, and what CI compares.
 
+import type { InsightSummary } from './findings.js';
 import { hotFunctions, withoutScript, type FlameTree, type HotFunction } from './flame.js';
 import type { Frame } from './frame.js';
 import { summarizeHttp, type HttpSummary } from './http.js';
 import { summarizeIo, type IoSummary } from './io.js';
-import { DEFAULT_INSIGHT_OPTIONS, floorTrend, type Insight, type InsightKind, type InsightOptions } from './insights.js';
+import { DEFAULT_INSIGHT_OPTIONS, floorTrend, type InsightOptions } from './insights.js';
 import { TASK_CATEGORIES, type QueueState, type TaskCategory, type TraceWindow } from './loop.js';
-import { GC_KINDS, type GcKind, type HostSample } from './protocol.js';
+import { GC_KINDS, type GcKind, type Hello, type HostSample } from './protocol.js';
 import type { Timeline } from './timeline.js';
 
 export interface Range {
   readonly avg: number;
   readonly max: number;
-}
-
-export interface InsightSummary {
-  readonly kind: InsightKind;
-  /** Frames it fired in (1 for state findings). */
-  readonly count: number;
-  /** The most severe occurrence. */
-  readonly worst: Insight;
-  /** For a loop stall not caused by GC: the busiest function of the CPU window around it. */
-  readonly culprit: HotFunction | null;
 }
 
 export interface LoopTraceSummary {
@@ -77,7 +68,7 @@ export interface SourceReport {
   /** Agent's own main-thread time, percent. */
   readonly overhead: Range;
   readonly insights: readonly InsightSummary[];
-  /** Empty unless CPU profiling ran. */
+  /** Over the whole run (every CPU window), the agent's own frames left out; empty unless CPU profiling ran. */
   readonly hotFunctions: readonly HotFunction[];
   /** Empty unless heap sampling ran; weights are bytes. */
   readonly topAllocations: readonly HotFunction[];
@@ -106,53 +97,6 @@ function maxOf(frames: readonly Frame[], value: (frame: Frame) => number): numbe
   return max;
 }
 
-function severity(insight: Insight): number {
-  switch (insight.kind) {
-    case 'loop-stall':
-      return insight.delay;
-    case 'gc-pressure':
-      return insight.pauseRatio;
-    case 'swapping':
-      return insight.majorFaultsPerSec;
-    case 'heap-growth':
-    case 'native-growth':
-      return insight.trend.bytesPerMin;
-    case 'near-heap-limit':
-      return insight.used / insight.limit;
-    case 'near-memory-limit':
-      return insight.rss / insight.limit;
-    case 'detached-contexts':
-      return insight.count;
-    case 'http-errors':
-      return insight.rate;
-    case 'http-slow':
-      return insight.p99;
-    case 'http-stuck':
-      return insight.oldest.ageMs;
-    case 'fs-blocking':
-    case 'dns-slow':
-      return insight.ms;
-    default: {
-      const unreachable: never = insight;
-      return unreachable;
-    }
-  }
-}
-
-/** One line per kind, worst first within the kind, kinds in first-seen order. */
-export function summarizeInsights(insights: readonly Insight[]): InsightSummary[] {
-  const byKind = new Map<InsightKind, { count: number; worst: Insight }>();
-  for (const insight of insights) {
-    const entry = byKind.get(insight.kind);
-    if (entry === undefined) byKind.set(insight.kind, { count: 1, worst: insight });
-    else {
-      entry.count++;
-      if (severity(insight) > severity(entry.worst)) entry.worst = insight;
-    }
-  }
-  return [...byKind].map(([kind, { count, worst }]) => ({ kind, count, worst, culprit: null }));
-}
-
 function summarizeLoopTrace(windows: readonly TraceWindow[], queues: readonly QueueState[]): LoopTraceSummary | null {
   if (windows.length === 0) return null;
   const executed = {} as Record<TaskCategory, number>;
@@ -174,30 +118,40 @@ function summarizeLoopTrace(windows: readonly TraceWindow[], queues: readonly Qu
   return { traced, executed, busy, dropped, queues: queues.filter((q) => q.pending > 0) };
 }
 
-/** Busiest function of the CPU window that overlaps `[t - spanMs, t]` the most. */
-export function stallCulprit(windows: readonly FlameTree[], t: number, spanMs: number): HotFunction | null {
-  let best: FlameTree | null = null;
-  let bestOverlap = 0;
-  for (const window of windows) {
-    const overlap = Math.min(window.end, t) - Math.max(window.start, t - spanMs);
-    if (overlap > bestOverlap) {
-      bestOverlap = overlap;
-      best = window;
-    }
-  }
-  return best === null ? null : (hotFunctions(best, 1)[0] ?? null);
-}
-
 export interface ReportOptions {
   readonly hotLimit: number;
   readonly insights: Partial<InsightOptions>;
 }
 
-/** `null` until the source has said hello. */
+/** Hot functions of one tree without the agent's frames (not the application's work), kept while the tree object lives (a whole-run tree changes per CPU window, not per report). */
+const hotByTree = new WeakMap<FlameTree, { readonly key: string; readonly hot: readonly HotFunction[] }>();
+
+function hotOf(tree: FlameTree, agentScript: string, limit: number): readonly HotFunction[] {
+  const key = `${limit}\u0000${agentScript}`;
+  const memo = hotByTree.get(tree);
+  if (memo?.key === key) return memo.hot;
+  const hot = hotFunctions(withoutScript(tree, agentScript), limit);
+  hotByTree.set(tree, { key, hot });
+  return hot;
+}
+
+/** The last report per timeline, valid while its version and the options stay the same. */
+const reports = new WeakMap<Timeline, { readonly version: number; readonly key: string; readonly report: SourceReport }>();
+
+/** `null` until the source has said hello. Built once per timeline version and options (callers share the result). */
 export function buildReport(timeline: Timeline, overrides: Partial<ReportOptions> = {}): SourceReport | null {
   const hello = timeline.hello;
   if (hello === null) return null;
   const options: ReportOptions = { hotLimit: 10, insights: {}, ...overrides };
+  const key = JSON.stringify(options);
+  const memo = reports.get(timeline);
+  if (memo !== undefined && memo.version === timeline.version && memo.key === key) return memo.report;
+  const report = createReport(timeline, hello, options);
+  reports.set(timeline, { version: timeline.version, key, report });
+  return report;
+}
+
+function createReport(timeline: Timeline, hello: Hello, options: ReportOptions): SourceReport {
   const trendOptions: InsightOptions = { ...DEFAULT_INSIGHT_OPTIONS, ...options.insights };
   const frames = timeline.frames();
   const first = frames[0];
@@ -219,16 +173,8 @@ export function buildReport(timeline: Timeline, overrides: Partial<ReportOptions
 
   const withUv = frames.filter((frame) => frame.loop.iterationsPerSec !== null);
   const swapFrames = frames.filter((frame) => frame.os.processSwap !== null);
-  // The agent's own frames are not the application's work.
-  const cpuWindows = timeline.cpuWindows().map((window) => withoutScript(window, hello.agentScript));
-  const allAllocations = timeline.allocations();
-  const allocations = allAllocations === null ? null : withoutScript(allAllocations, hello.agentScript);
-  const cpu = timeline.cpuFlame();
-  const insights = summarizeInsights(timeline.insights(options.insights)).map((summary) =>
-    summary.worst.kind === 'loop-stall' && summary.worst.cause === 'unknown'
-      ? { ...summary, culprit: stallCulprit(cpuWindows, summary.worst.t, hello.intervalMs) }
-      : summary,
-  );
+  const cpu = timeline.cpuFlameTotal();
+  const allocations = timeline.allocations();
 
   return {
     pid: hello.pid,
@@ -258,9 +204,9 @@ export function buildReport(timeline: Timeline, overrides: Partial<ReportOptions
     },
     gc: { count: gcCount, pause: gcPause, maxPause: maxOf(frames, (frame) => frame.gc.maxPause), pauseRatio: elapsed > 0 ? gcPause / elapsed : 0, byKind },
     overhead: range(frames, (frame) => frame.overhead),
-    insights,
-    hotFunctions: cpu ? hotFunctions(withoutScript(cpu, hello.agentScript), options.hotLimit) : [],
-    topAllocations: allocations ? hotFunctions(allocations, options.hotLimit) : [],
+    insights: timeline.findings(options.insights),
+    hotFunctions: cpu ? hotOf(cpu, hello.agentScript, options.hotLimit) : [],
+    topAllocations: allocations ? hotOf(allocations, hello.agentScript, options.hotLimit) : [],
     loopTrace: summarizeLoopTrace(timeline.traceWindows(), timeline.queues()),
     http: { server: summarizeHttp(timeline.httpWindows(), 'server'), client: summarizeHttp(timeline.httpWindows(), 'client') },
     io: { fs: summarizeIo(timeline.ioWindows(), 'fs'), fsSync: summarizeIo(timeline.ioWindows(), 'fsSync'), dns: summarizeIo(timeline.ioWindows(), 'dns') },

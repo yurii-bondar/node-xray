@@ -1,6 +1,6 @@
 // Event loop trace: what ran, in which phase, in which iteration, and what is still queued.
 
-import type { LoopTraceCounter, LoopTraceEvent, LoopTraceMessage } from './protocol.js';
+import type { LoopTraceEvent, LoopTraceMessage } from './protocol.js';
 
 export type TaskCategory = 'timer' | 'io' | 'immediate' | 'nextTick' | 'microtask' | 'promise';
 
@@ -188,19 +188,31 @@ export function summarizeTrace(trace: LoopTraceMessage): TraceWindow {
 export interface QueueState {
   readonly resource: string;
   readonly category: TaskCategory;
-  /** Created and not yet settled since tracing started; resources older than the trace are not counted. */
+  /**
+   * Created and not yet settled since tracing started (see `LoopTraceCounter.settled`): waiting promises
+   * and timers, and for sockets and other handles, no callback yet. Resources older than the trace are not counted.
+   */
   readonly pending: number;
   readonly created: number;
   readonly executed: number;
   readonly busy: number;
 }
 
-/** Running totals per resource type across trace batches. */
+/**
+ * Running totals per resource type over one trace session. The batches of a session are contiguous
+ * (each starts where the previous one ended), so a gap means tracing was stopped and started again
+ * (or a batch was lost): the totals start over, or resources of the earlier session would stay
+ * pending forever.
+ */
 export class TaskLedger {
   readonly #byResource = new Map<string, { created: number; executed: number; settled: number; busy: number }>();
+  /** End of the last batch applied; `null` before the first one. */
+  #end: number | null = null;
 
-  apply(counters: readonly LoopTraceCounter[]): void {
-    for (const counter of counters) {
+  apply(trace: LoopTraceMessage): void {
+    if (this.#end !== null && trace.start !== this.#end) this.#byResource.clear();
+    this.#end = trace.end;
+    for (const counter of trace.counters) {
       let entry = this.#byResource.get(counter.resource);
       if (entry === undefined) {
         entry = { created: 0, executed: 0, settled: 0, busy: 0 };
@@ -230,7 +242,9 @@ export class TaskLedger {
     return out;
   }
 
+  /** Forgets everything (a restarted agent starts its trace sessions over). */
   clear(): void {
     this.#byResource.clear();
+    this.#end = null;
   }
 }

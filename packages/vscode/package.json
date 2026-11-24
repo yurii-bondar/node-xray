@@ -15,6 +15,9 @@
     "Visualization"
   ],
   "main": "./dist/extension.cjs",
+  "extensionKind": [
+    "workspace"
+  ],
   "contributes": {
     "commands": [
       {
@@ -54,6 +57,7 @@
         "xray.nodePath": {
           "type": "string",
           "default": "node",
+          "scope": "machine-overridable",
           "description": "Node.js used to run xray itself (version 22 or newer). The profiled program can use any Node from version 20."
         },
         "xray.cpu": {
@@ -75,6 +79,7 @@
           "type": "number",
           "default": 0.5,
           "minimum": 0,
+          "maximum": 100,
           "description": "Mark a line in the editor when it takes at least this percentage of CPU work."
         }
       }

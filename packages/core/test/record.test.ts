@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { encodeRecord, parseRecord } from '../src/record.js';
+import { encodeClosedRecord, encodeRecord, parseRecord, recordPayload } from '../src/record.js';
 import { describeInsight, formatMs } from '../src/text.js';
 import { hello } from './fixtures.js';
 
@@ -9,6 +9,16 @@ describe('records', () => {
     const line = encodeRecord(3, JSON.stringify(hello));
     assert.equal(line, `{"c":3,"m":${JSON.stringify(hello)}}`);
     assert.deepEqual(parseRecord(line), { ok: true, value: { connection: 3, message: hello } });
+  });
+
+  it('marks a closed connection, readable by both parsers', () => {
+    const line = encodeClosedRecord(4);
+    assert.equal(line, '{"c":4,"closed":true}');
+    assert.deepEqual(parseRecord(line), { ok: true, value: { connection: 4, closed: true } });
+    assert.deepEqual(recordPayload(line), { connection: 4, closed: true });
+    assert.deepEqual(recordPayload(encodeRecord(3, '{"type":"x"}')), { connection: 3, raw: '{"type":"x"}' });
+    assert.equal(recordPayload('not a record'), null);
+    assert.deepEqual(parseRecord('{"c":4,"closed":false}'), { ok: false, error: '$.closed: expected true' });
   });
 
   it('says what is wrong with a bad record', () => {

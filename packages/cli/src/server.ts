@@ -1,13 +1,14 @@
 // Local HTTP server for the dashboard: static files, an SSE stream of records, commands.
 // Binds 127.0.0.1 only. The inspector behind the agents runs arbitrary code, so every
-// /api request needs the per-run token, and Host must be ours (no DNS rebinding).
+// /api request needs the per-run token, and Host must be ours (no DNS rebinding): a local
+// name, or the one extra host a port forward uses (`XRAY_DASHBOARD_HOST`, see `parseExtraHost`).
 
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import path from 'node:path';
-import { encodeRecord, parseAgentCommand, positionKey, scriptPath, type AgentCommand, type Original, type SourceId, type SourcePosition } from '@node-xray/core';
+import { encodeClosedRecord, encodeRecord, parseAgentCommand, positionKey, scriptPath, type AgentCommand, type Original, type SourceId, type SourcePosition } from '@node-xray/core';
 import { Backlog } from './backlog.js';
 import type { Collector } from './collector.js';
 import { exportProfile, type ProfileKind } from './profiles.js';
@@ -42,8 +43,10 @@ const MAX_BODY_BYTES = 64 * 1024;
 const LOCAL_HOSTS: ReadonlySet<string> = new Set(['127.0.0.1', 'localhost', '[::1]']);
 /** Positions per /api/resolve request. */
 const MAX_POSITIONS = 500;
-/** A browser tab that stops reading is dropped; it reconnects and gets the backlog. */
+/** Live data a browser tab may fall behind by before it is dropped; it reconnects and gets the backlog. */
 const MAX_CLIENT_BUFFER = 32 * 1024 * 1024;
+/** The backlog goes out in writes of about this size, each after the previous one drained. */
+const BACKLOG_WRITE = 64 * 1024;
 
 export interface DashboardServerOptions {
   readonly collector: Collector;
@@ -55,6 +58,68 @@ export interface DashboardServerOptions {
   readonly status: RunStatus;
   /** Use this token instead of a random one (at least 16 URL-safe characters); null = random. */
   readonly token: string | null;
+  /** One more Host the dashboard answers to besides the local names; null = none. */
+  readonly extraHost: ExtraHost | null;
+  /** `MAX_CLIENT_BUFFER` unless a test needs a small one. */
+  readonly maxClientBuffer?: number;
+}
+
+/** A Host header value other than the local names, e.g. a forwarded port's `*.app.github.dev`. */
+export interface ExtraHost {
+  /** Lower case. */
+  readonly name: string;
+  /** Null: any port (or none), as for the local names. */
+  readonly port: string | null;
+}
+
+const HOST_NAME = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$/;
+
+/**
+ * `XRAY_DASHBOARD_HOST`: opt-in, for a dashboard reached through a port forward (VS Code remote,
+ * Codespaces) whose browser sends another Host. One exact `host` or `host:port`, no wildcards;
+ * the token stays mandatory. Null when the value is not one.
+ */
+export function parseExtraHost(value: string): ExtraHost | null {
+  const match = /^([^:]+)(?::(\d{1,5}))?$/.exec(value.trim().toLowerCase());
+  const name = match?.[1];
+  const port = match?.[2];
+  if (name === undefined || name.length > 253 || !HOST_NAME.test(name)) return null;
+  if (port !== undefined && (Number(port) < 1 || Number(port) > 65535)) return null;
+  return { name, port: port === undefined ? null : String(Number(port)) };
+}
+
+/** Whether a Host header names this server: a local name, or the extra host. */
+export function hostAllowed(header: string, extra: ExtraHost | null): boolean {
+  const host = header.toLowerCase();
+  const name = host.replace(/:\d+$/, '');
+  if (LOCAL_HOSTS.has(name)) return true;
+  if (extra === null || name !== extra.name) return false;
+  return extra.port === null || host === `${name}:${extra.port}`;
+}
+
+/** One `/api/stream` reader. */
+interface Client {
+  readonly res: http.ServerResponse;
+  /** Live chunks held back while the backlog is still going out; null once it is through. */
+  queue: string[] | null;
+  queued: number;
+}
+
+/** Writes and resolves once the response can take more: true, or false when it closed first. */
+function write(res: http.ServerResponse, chunk: string): Promise<boolean> {
+  if (res.destroyed) return Promise.resolve(false);
+  if (res.write(chunk)) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    const settle = (ok: boolean): void => {
+      res.off('drain', drained);
+      res.off('close', closed);
+      resolve(ok);
+    };
+    const drained = (): void => settle(true);
+    const closed = (): void => settle(false);
+    res.on('drain', drained);
+    res.on('close', closed);
+  });
 }
 
 export interface CommandRequest {
@@ -99,25 +164,34 @@ function sameToken(given: string | null, token: string): boolean {
 export class DashboardServer {
   readonly token: string;
   readonly #server: http.Server;
-  readonly #clients = new Set<http.ServerResponse>();
+  readonly #clients = new Set<Client>();
   readonly #backlog = new Backlog();
   readonly #files = new Map<string, Buffer>();
   readonly #unsubscribe: () => void;
+  readonly #maxClientBuffer: number;
   #status: RunStatus;
   #port = 0;
 
   constructor(private readonly options: DashboardServerOptions) {
     this.token = options.token !== null && /^[A-Za-z0-9_-]{16,}$/.test(options.token) ? options.token : randomBytes(18).toString('base64url');
     this.#status = options.status;
+    this.#maxClientBuffer = options.maxClientBuffer ?? MAX_CLIENT_BUFFER;
     this.#server = http.createServer((req, res) => {
       this.#handle(req, res).catch(() => {
         if (!res.headersSent) res.writeHead(500);
         res.end();
       });
     });
-    this.#unsubscribe = options.collector.onRecord((connection, raw, message) => {
-      this.#backlog.add(connection, raw, message);
-      this.#broadcast(`data: ${encodeRecord(connection, raw)}\n\n`);
+    this.#unsubscribe = options.collector.onRecord({
+      record: (connection, raw, message) => {
+        this.#backlog.add(connection, raw, message);
+        this.#broadcast(`data: ${encodeRecord(connection, raw)}\n\n`);
+      },
+      closed: (connection) => {
+        this.#backlog.closed(connection);
+        this.#broadcast(`data: ${encodeClosedRecord(connection)}\n\n`);
+      },
+      dropped: (connection) => this.#backlog.drop(connection),
     });
   }
 
@@ -141,7 +215,7 @@ export class DashboardServer {
 
   async close(): Promise<void> {
     this.#unsubscribe();
-    for (const client of this.#clients) client.end();
+    for (const client of this.#clients) client.res.end();
     this.#clients.clear();
     this.#server.closeAllConnections();
     await new Promise<void>((resolve) => this.#server.close(() => resolve()));
@@ -149,19 +223,29 @@ export class DashboardServer {
 
   #broadcast(chunk: string): void {
     for (const client of this.#clients) {
-      if (client.writableLength > MAX_CLIENT_BUFFER) {
-        client.destroy();
-        this.#clients.delete(client);
+      if (client.queue !== null) {
+        client.queue.push(chunk);
+        client.queued += chunk.length;
+        if (client.queued > this.#maxClientBuffer) this.#drop(client);
         continue;
       }
-      client.write(chunk);
+      if (client.res.writableLength > this.#maxClientBuffer) {
+        this.#drop(client);
+        continue;
+      }
+      client.res.write(chunk);
     }
+  }
+
+  #drop(client: Client): void {
+    client.res.destroy();
+    this.#clients.delete(client);
   }
 
   async #handle(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     // DNS rebinding sends another host name; the port may differ behind a forward (VS Code remote).
     const host = req.headers.host ?? '';
-    if (!LOCAL_HOSTS.has(host.replace(/:\d+$/, ''))) {
+    if (!hostAllowed(host, this.options.extraHost)) {
       res.writeHead(403).end();
       return;
     }
@@ -176,6 +260,7 @@ export class DashboardServer {
       if (req.method === 'POST' && url.pathname === '/api/resolve') return this.#resolve(req, res);
       if (req.method === 'GET' && url.pathname === '/api/export') return this.#export(url, res);
       if (req.method === 'GET' && url.pathname === '/api/lines') return this.#lines(res);
+      if (req.method === 'GET' && url.pathname === '/api/status') return this.#statusOf(res);
       res.writeHead(404).end();
       return;
     }
@@ -200,11 +285,38 @@ export class DashboardServer {
 
   #stream(res: http.ServerResponse): void {
     res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-store', connection: 'keep-alive' });
+    const client: Client = { res, queue: [], queued: 0 };
+    this.#clients.add(client);
+    res.on('close', () => this.#clients.delete(client));
+    this.#catchUp(client).catch(() => this.#drop(client));
+  }
+
+  /**
+   * The backlog (up to tens of MB after a long run with --cpu --trace-loop) in pieces, each after
+   * the previous one drained, never as one string; then the live chunks that arrived meanwhile.
+   * Only after that does the client get live data directly, under `maxClientBuffer`.
+   */
+  async #catchUp(client: Client): Promise<void> {
     let chunk = `retry: 2000\n\nevent: reset\ndata: {}\n\nevent: status\ndata: ${JSON.stringify(this.#status)}\n\n`;
-    for (const record of this.#backlog.records()) chunk += `data: ${record}\n\n`;
-    res.write(chunk);
-    this.#clients.add(res);
-    res.on('close', () => this.#clients.delete(res));
+    for (const record of this.#backlog.records()) {
+      chunk += `data: ${record}\n\n`;
+      if (chunk.length < BACKLOG_WRITE) continue;
+      if (!(await write(client.res, chunk))) return;
+      chunk = '';
+    }
+    if (chunk !== '' && !(await write(client.res, chunk))) return;
+    while (client.queue !== null && client.queue.length > 0) {
+      const queued = client.queue.join('');
+      client.queue = [];
+      client.queued = 0;
+      if (!(await write(client.res, queued))) return;
+    }
+    client.queue = null;
+  }
+
+  /** What the SSE `status` event says, for a client that does not stream (the VS Code extension). */
+  #statusOf(res: http.ServerResponse): void {
+    res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify(this.#status));
   }
 
   /** The JSON body, or undefined after answering 415 / 413 / 400 itself. */

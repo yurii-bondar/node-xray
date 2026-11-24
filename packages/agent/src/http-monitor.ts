@@ -21,6 +21,9 @@ const MAX_ROUTES = 100;
 const EXAMPLES = 5;
 const STUCK_AFTER_MS = 1000;
 const ROUTE_CACHE = 2000;
+const HOST_CACHE = 256;
+/** Requests ended in one tick whose route is worked out on the tick; beyond this, right away. */
+const MAX_ENDED = 10_000;
 
 function field(value: unknown, key: string): unknown {
   return typeof value === 'object' && value !== null ? Reflect.get(value, key) : undefined;
@@ -30,13 +33,30 @@ function text(value: unknown, fallback = ''): string {
   return typeof value === 'string' ? value : fallback;
 }
 
-interface Running {
+export interface RequestStart {
   readonly start: number;
   readonly method: string;
   /** Host (client side only). */
   readonly host: string;
   /** Raw path with query. */
   readonly path: string;
+}
+
+export interface Outcome {
+  /** 0 = failed without a response. */
+  readonly status: number;
+  /** Route pattern the framework matched (Express `req.route.path`), relative to `base`. */
+  readonly pattern?: string | undefined;
+  /** Mount path of the router that matched (`req.baseUrl`). */
+  readonly base?: string | undefined;
+}
+
+/** A request from start to the tick that counts it; the end fields are set when it ends. */
+interface Running extends RequestStart {
+  status: number;
+  ms: number;
+  pattern: string | null;
+  base: string;
 }
 
 /** One direction (served or made): counters for the tick plus what is running now. */
@@ -51,23 +71,29 @@ export class HttpSideAggregator {
   #routes = new Map<string, { count: number; errors: number; totalMs: number; maxMs: number }>();
   #slowest: HttpExample[] = [];
   readonly #routeCache = new Map<string, string>();
+  /** Ended this tick, waiting for their route key. */
+  readonly #ended: Running[] = [];
 
-  begin(key: object, request: Running): void {
+  begin(key: object, request: RequestStart): void {
     this.#started++;
-    this.running.set(key, request);
+    this.running.set(key, { start: request.start, method: request.method, host: request.host, path: request.path, status: 0, ms: 0, pattern: null, base: '' });
   }
 
-  /** `status` 0 = failed without a response. `route` overrides the normalised path (framework patterns). */
-  end(key: object, now: number, outcome: { readonly status: number; readonly route?: string }): void {
+  /**
+   * Called on the application's request path: only numbers here. Route keys (string work and
+   * route normalisation) are built on the tick.
+   */
+  end(key: object, now: number, outcome: Outcome): void {
     const running = this.running.get(key);
     if (running === undefined) return;
     this.running.delete(key);
     const status = outcome.status;
     const ms = now - running.start;
-    const route = this.#routeKey(running, outcome.route);
-    const failed = status === 0;
-    const errored = failed || status >= 500;
-    if (failed) this.#failed++;
+    running.status = status;
+    running.ms = ms;
+    running.pattern = outcome.pattern ?? null;
+    running.base = outcome.base ?? '';
+    if (status === 0) this.#failed++;
     else {
       this.#finished++;
       const cls = statusClass(status);
@@ -76,7 +102,14 @@ export class HttpSideAggregator {
       this.#histogram[bucket] = (this.#histogram[bucket] ?? 0) + 1;
       if (ms > this.#maxMs) this.#maxMs = ms;
     }
+    if (this.#ended.length < MAX_ENDED) this.#ended.push(running);
+    else this.#route(running);
+  }
 
+  #route(ended: Running): void {
+    const { status, ms } = ended;
+    const route = this.#routeKey(ended, ended.pattern === null ? undefined : `${ended.base}${ended.pattern}` || '/');
+    const errored = status === 0 || status >= 500;
     let entry = this.#routes.get(route);
     if (entry === undefined) {
       const key = this.#routes.size < MAX_ROUTES ? route : '(other)';
@@ -102,6 +135,8 @@ export class HttpSideAggregator {
 
   /** The tick's numbers; counters start over, running requests carry on. */
   snapshot(now: number): HttpSide {
+    for (const ended of this.#ended) this.#route(ended);
+    this.#ended.length = 0;
     const stuck: HttpStuck[] = [];
     for (const running of this.running.values()) {
       const ageMs = now - running.start;
@@ -133,7 +168,7 @@ export class HttpSideAggregator {
     return side;
   }
 
-  #routeKey(running: Running, override?: string): string {
+  #routeKey(running: RequestStart, override?: string): string {
     const query = running.path.indexOf('?');
     const bare = query === -1 ? running.path : running.path.slice(0, query);
     let route = override;
@@ -150,10 +185,10 @@ export class HttpSideAggregator {
 }
 
 /** Express sets `req.route.path` (relative to `req.baseUrl`) once routing matched. */
-function frameworkRoute(request: unknown): string | undefined {
+function routeOutcome(request: unknown, status: number): Outcome {
   const pattern = field(field(request, 'route'), 'path');
-  if (typeof pattern !== 'string') return undefined;
-  return `${text(field(request, 'baseUrl'))}${pattern}` || '/';
+  if (typeof pattern !== 'string') return { status };
+  return { status, pattern, base: text(field(request, 'baseUrl')) };
 }
 
 function hostOf(origin: string): string {
@@ -170,10 +205,10 @@ export interface HttpMonitorDeps {
   readonly now: () => number;
   readonly timeOrigin: number;
   readonly intervalMs: number;
-  readonly addOverhead: (us: number) => void;
 }
 
-type Handler = (message: unknown) => void;
+/** `at`: `now()` when the message arrived. */
+type Handler = (message: unknown, at: number) => void;
 
 export class HttpMonitor {
   readonly server = new HttpSideAggregator();
@@ -181,72 +216,74 @@ export class HttpMonitor {
   #subscriptions: Array<[string, (message: unknown, name: string | symbol) => void]> = [];
   #timer: NodeJS.Timeout | null = null;
   #lastTick = 0;
+  /** fetch() origin → host: `new URL` on every request would be the costliest step of a subscriber. */
+  readonly #hosts = new Map<string, string>();
   /** Nothing is sent until the process has done any HTTP: no empty ticks from a CLI tool. */
   #active = false;
 
   constructor(private readonly deps: HttpMonitorDeps) {}
 
   start(): void {
-    const { self } = this.deps;
+    const { self, now } = this.deps;
     const on = (name: string, handler: Handler): void => {
       const listener = (message: unknown): void => {
+        const at = now();
         // A throwing subscriber surfaces as an uncaught exception in the application.
         try {
           this.#active = true;
-          handler(message);
+          handler(message, at);
         } catch (error) {
           self.report(error);
         }
+        self.addOverhead((now() - at) * 1000);
       };
       dc.subscribe(name, listener);
       this.#subscriptions.push([name, listener]);
     };
-    const now = this.deps.now;
 
-    on('http.server.request.start', (m) => {
+    on('http.server.request.start', (m, at) => {
       const request = field(m, 'request');
       const response = field(m, 'response');
       if (typeof response !== 'object' || response === null) return;
-      this.server.begin(response, { start: now(), method: text(field(request, 'method'), 'GET'), host: '', path: text(field(request, 'url'), '/') });
+      this.server.begin(response, { start: at, method: text(field(request, 'method'), 'GET'), host: '', path: text(field(request, 'url'), '/') });
     });
-    on('http.server.response.finish', (m) => {
+    on('http.server.response.finish', (m, at) => {
       const response = field(m, 'response');
       if (typeof response !== 'object' || response === null) return;
       const status = field(response, 'statusCode');
-      const route = frameworkRoute(field(m, 'request'));
-      this.server.end(response, now(), { status: typeof status === 'number' ? status : 200, ...(route === undefined ? {} : { route }) });
+      this.server.end(response, at, routeOutcome(field(m, 'request'), typeof status === 'number' ? status : 200));
     });
 
-    on('http.client.request.start', (m) => {
+    on('http.client.request.start', (m, at) => {
       const request = field(m, 'request');
       if (typeof request !== 'object' || request === null) return;
-      this.client.begin(request, { start: now(), method: text(field(request, 'method'), 'GET'), host: text(field(request, 'host')), path: text(field(request, 'path'), '/') });
+      this.client.begin(request, { start: at, method: text(field(request, 'method'), 'GET'), host: text(field(request, 'host')), path: text(field(request, 'path'), '/') });
     });
-    on('http.client.response.finish', (m) => {
+    on('http.client.response.finish', (m, at) => {
       const request = field(m, 'request');
       const status = field(field(m, 'response'), 'statusCode');
-      if (typeof request === 'object' && request !== null) this.client.end(request, now(), { status: typeof status === 'number' ? status : 200 });
+      if (typeof request === 'object' && request !== null) this.client.end(request, at, { status: typeof status === 'number' ? status : 200 });
     });
-    on('http.client.request.error', (m) => {
+    on('http.client.request.error', (m, at) => {
       const request = field(m, 'request');
-      if (typeof request === 'object' && request !== null) this.client.end(request, now(), { status: 0 });
+      if (typeof request === 'object' && request !== null) this.client.end(request, at, { status: 0 });
     });
 
     // fetch() is undici, which has its own channels. Its requests are timed to the response
     // headers: `trailers` only comes once the body is read, and many callers never read it.
-    on('undici:request:create', (m) => {
+    on('undici:request:create', (m, at) => {
       const request = field(m, 'request');
       if (typeof request !== 'object' || request === null) return;
-      this.client.begin(request, { start: now(), method: text(field(request, 'method'), 'GET'), host: hostOf(text(field(request, 'origin'))), path: text(field(request, 'path'), '/') });
+      this.client.begin(request, { start: at, method: text(field(request, 'method'), 'GET'), host: this.#host(text(field(request, 'origin'))), path: text(field(request, 'path'), '/') });
     });
-    on('undici:request:headers', (m) => {
+    on('undici:request:headers', (m, at) => {
       const request = field(m, 'request');
       const status = field(field(m, 'response'), 'statusCode');
-      if (typeof request === 'object' && request !== null) this.client.end(request, now(), { status: typeof status === 'number' ? status : 200 });
+      if (typeof request === 'object' && request !== null) this.client.end(request, at, { status: typeof status === 'number' ? status : 200 });
     });
-    on('undici:request:error', (m) => {
+    on('undici:request:error', (m, at) => {
       const request = field(m, 'request');
-      if (typeof request === 'object' && request !== null) this.client.end(request, now(), { status: 0 });
+      if (typeof request === 'object' && request !== null) this.client.end(request, at, { status: 0 });
     });
 
     this.#lastTick = now();
@@ -276,6 +313,15 @@ export class HttpMonitor {
       client: this.client.snapshot(started),
     });
     this.#lastTick = started;
-    this.deps.addOverhead((this.deps.now() - started) * 1000);
+  }
+
+  #host(origin: string): string {
+    let host = this.#hosts.get(origin);
+    if (host === undefined) {
+      host = hostOf(origin);
+      if (this.#hosts.size >= HOST_CACHE) this.#hosts.clear();
+      this.#hosts.set(origin, host);
+    }
+    return host;
   }
 }

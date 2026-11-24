@@ -4,6 +4,8 @@ export {
   cpuFlame,
   hotFunctions,
   mergeFlames,
+  stacksOf,
+  type CallStack,
   type FlameFrame,
   type FlameNode,
   type FlameTree,
@@ -32,23 +34,31 @@ export {
 export { encodeLine, LineDecoder, LineTooLongError } from './ndjson.js';
 export * from './protocol.js';
 export { Ring } from './ring.js';
-export { DEFAULT_TIMELINE_OPTIONS, Timeline, type TimelineOptions } from './timeline.js';
+export { DEFAULT_TIMELINE_OPTIONS, Timeline, type FindingsSpan, type TimelineOptions } from './timeline.js';
 export type { WireGcEvent, WireLoopTrace, WireLoopTraceCounter, WireMessage, WireProfile, WireRusage, WireSample } from './wire.js';
+export { buildHostReport, buildReport, type GpuReport, type HostReport, type LoopTraceSummary, type Range, type ReportOptions, type SourceReport } from './report.js';
 export {
-  buildHostReport,
-  buildReport,
+  culpritWindow,
+  insightTime,
+  stallCulprit,
   summarizeInsights,
-  type GpuReport,
-  type HostReport,
+  type CulpritWindow,
   type InsightSummary,
-  type LoopTraceSummary,
-  type Range,
-  type ReportOptions,
-  type SourceReport,
-} from './report.js';
-export { encodeRecord, HOST_CONNECTION, parseRecord, recordPayload, type StreamRecord } from './record.js';
+  type StallCulprit,
+  type StallSpan,
+} from './findings.js';
+export {
+  encodeClosedRecord,
+  encodeRecord,
+  HOST_CONNECTION,
+  parseRecord,
+  recordPayload,
+  type ClosedRecord,
+  type RecordEntry,
+  type RecordPayload,
+  type StreamRecord,
+} from './record.js';
 export { CATEGORY_LABEL, describeInsight, formatBytes, formatMs, formatPercent, formatShare } from './text.js';
-export { stallCulprit } from './report.js';
 export { withoutScript } from './flame.js';
 export { changedFunctions, diffFlames, workOf, type DiffNode, type FunctionChange } from './diff.js';
 export { toCpuProfile, toHeapProfile, type ExportedCpuProfile, type ExportedHeapProfile } from './export.js';

@@ -23,8 +23,17 @@ export interface Source {
   send(command: AgentCommand): void;
 }
 
-/** `raw` is the message exactly as received, for verbatim re-embedding (`encodeRecord`). */
-export type RecordListener = (connection: number, raw: string, message: StreamMessage) => void;
+/** Ended sources kept for the summary, the report and a dashboard that connects later; live ones are always kept. */
+export const MAX_ENDED_SOURCES = 16;
+
+export interface RecordListener {
+  /** `raw` is the message exactly as received, for verbatim re-embedding (`encodeRecord`). */
+  record(connection: number, raw: string, message: StreamMessage): void;
+  /** The connection ended: nothing more comes from it. */
+  closed(connection: number): void;
+  /** What was kept for an ended connection was dropped (more than `MAX_ENDED_SOURCES` ended). */
+  dropped?(connection: number): void;
+}
 
 /** The collector's side of one agent transport. */
 export interface AgentLink {
@@ -52,6 +61,11 @@ export class Collector {
   readonly #server: net.Server;
   readonly #links = new Set<AgentLink>();
   readonly #listeners = new Set<RecordListener>();
+  /** Connections that said hello → their source. */
+  readonly #sourceOf = new Map<number, SourceId>();
+  /** Ended connections, oldest first, at most `MAX_ENDED_SOURCES`. */
+  readonly #ended: number[] = [];
+  #droppedSources = 0;
   #nextConnection = HOST_CONNECTION + 1;
   #idle: Array<() => void> = [];
 
@@ -78,6 +92,11 @@ export class Collector {
   applyHost(sample: HostSample): void {
     this.host.apply(sample);
     this.#emit(HOST_CONNECTION, JSON.stringify(sample), sample);
+  }
+
+  /** Ended sources whose data was dropped to keep memory bounded (worker pools churn threads). */
+  get droppedSources(): number {
+    return this.#droppedSources;
   }
 
   /** Sends to one source, or to all of them when `target` is null. Returns how many got it. */
@@ -116,7 +135,24 @@ export class Collector {
   }
 
   #emit(connection: number, raw: string, message: StreamMessage): void {
-    for (const listener of this.#listeners) listener(connection, raw, message);
+    for (const listener of this.#listeners) listener.record(connection, raw, message);
+  }
+
+  /** Tells listeners, then drops the oldest ended connections beyond `MAX_ENDED_SOURCES`. */
+  #end(connection: number): void {
+    for (const listener of this.#listeners) listener.closed(connection);
+    this.#ended.push(connection);
+    while (this.#ended.length > MAX_ENDED_SOURCES) {
+      const oldest = this.#ended.shift();
+      if (oldest === undefined) break;
+      const id = this.#sourceOf.get(oldest);
+      this.#sourceOf.delete(oldest);
+      if (id !== undefined && this.sources.get(id)?.connection === oldest) {
+        this.sources.delete(id);
+        this.#droppedSources++;
+      }
+      for (const listener of this.#listeners) listener.dropped?.(oldest);
+    }
   }
 
   /**
@@ -140,12 +176,14 @@ export class Collector {
         if (parsed.value.type === 'hello') {
           const id = toSourceId(parsed.value.pid, parsed.value.threadId);
           this.sources.set(id, { id, connection, timeline, send });
+          this.#sourceOf.set(connection, id);
           for (const command of this.options.startupCommands) send(command);
         }
       },
       problem: (message) => timeline.apply({ type: 'agent-error', message }),
       closed: () => {
-        this.#links.delete(link);
+        if (!this.#links.delete(link)) return;
+        this.#end(connection);
         if (this.#links.size === 0) {
           const waiting = this.#idle;
           this.#idle = [];

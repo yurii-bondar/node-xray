@@ -168,6 +168,9 @@ describe('agent bundle', () => {
         await fs.promises.stat('/');
         await fs.promises.readFile('/definitely/missing').catch(() => {});
         await new Promise((resolve) => fs.readdir('/', resolve));
+        const log = require('node:path').join(require('node:os').tmpdir(), 'xray-append-' + process.pid + '.log');
+        await new Promise((resolve) => fs.appendFile(log, 'line', resolve));
+        await fs.promises.unlink(log);
         setTimeout(() => {}, 250);
       }, 200);
     `,
@@ -183,6 +186,18 @@ describe('agent bundle', () => {
     assert.ok(keys('fs').includes('readdir /'));
     const missing = ticks.flatMap((t) => t.fs.operations).find((o) => o.key === 'readFile /definitely/missing');
     assert.equal(missing?.errors, 1);
+    // Node's appendFile runs writeFile, open, write and close through the module: one call.
+    const appended = keys('fs').filter((k) => k.includes('xray-append-') || k.endsWith(' (fd)'));
+    assert.equal(appended.length, 2, appended.join(', '));
+    assert.ok(appended.some((k) => k.startsWith('appendFile ')) && appended.some((k) => k.startsWith('unlink ')));
+  });
+
+  it('loads node:inspector only once profiling starts', async () => {
+    const script = "setTimeout(() => console.log(process.moduleLoadList.includes('NativeModule inspector')), 200)";
+    assert.equal((await run(script)).stdout, 'false\n');
+    const profiled = await run(script, [{ type: 'cpu-profile-start', samplingIntervalUs: 1000, windowMs: 60_000 }]);
+    assert.equal(profiled.stdout, 'true\n');
+    assert.deepEqual(ofType(profiled.messages, 'agent-error'), []);
   });
 
   it('sends no HTTP ticks for a process without HTTP', async () => {

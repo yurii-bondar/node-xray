@@ -128,3 +128,11 @@ export function iterationDetail(events: readonly LoopEvent[], iteration: Iterati
     .sort((a, b) => a.start - b.start);
   return { iteration, callbacks, groups: groupCallbacks(callbacks) };
 }
+
+/** The iteration `delta` steps from the selected one (the newest when none is), clamped to the ends; for the arrow keys. */
+export function stepIteration(iterations: readonly Iteration[], selected: number | null, delta: number): Iteration | undefined {
+  if (iterations.length === 0) return undefined;
+  const at = iterations.findIndex((it) => it.index === selected);
+  const from = at === -1 ? iterations.length - 1 : at;
+  return iterations[Math.min(iterations.length - 1, Math.max(0, from + delta))];
+}

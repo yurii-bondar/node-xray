@@ -92,15 +92,31 @@ describe('summarizeTrace / TaskLedger', () => {
     assert.deepEqual(window.byCategory.immediate, { created: 0, executed: 0, busy: 0 });
   });
 
+  const batch = (start: number, batchCounters: LoopTraceMessage['counters']): LoopTraceMessage => ({ ...trace([], batchCounters), start, end: start + 250 });
+
   it('accumulates pending work across batches, never below zero', () => {
     const ledger = new TaskLedger();
-    ledger.apply(counters);
-    ledger.apply([{ resource: 'Timeout', created: 0, executed: 1, settled: 6, busy: 1 }]);
+    ledger.apply(batch(0, counters));
+    ledger.apply(batch(250, [{ resource: 'Timeout', created: 0, executed: 1, settled: 6, busy: 1 }]));
     const byResource = new Map(ledger.snapshot().map((q) => [q.resource, q]));
     assert.equal(byResource.get('PROMISE')?.pending, 3);
     assert.equal(byResource.get('TCPWRAP')?.pending, 1);
     assert.equal(byResource.get('Timeout')?.pending, 0, 'timers older than the trace settle without being counted');
     assert.equal(byResource.get('Timeout')?.executed, 4);
     assert.equal(ledger.snapshot()[0]?.resource, 'PROMISE');
+  });
+
+  it('starts over with a new trace session (a gap between batches) and when cleared', () => {
+    const ledger = new TaskLedger();
+    ledger.apply(batch(0, counters));
+    ledger.apply(batch(5000, [{ resource: 'Timeout', created: 1, executed: 0, settled: 0, busy: 0 }]));
+    assert.deepEqual(
+      ledger.snapshot().map((q) => [q.resource, q.pending, q.created]),
+      [['Timeout', 1, 1]],
+      'the first session no longer shows as pending',
+    );
+    ledger.clear();
+    ledger.apply(batch(5250, counters));
+    assert.equal(ledger.snapshot().find((q) => q.resource === 'Timeout')?.created, 4, 'a cleared ledger takes any batch as the start');
   });
 });

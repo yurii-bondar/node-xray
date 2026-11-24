@@ -1,5 +1,6 @@
-// The webview: the CLI's dashboard in an iframe, and a relay for "open this code" messages.
-// Messages from the iframe are narrowed here before the extension acts on them.
+// The webview: the CLI's dashboard in an iframe, a relay for "open this code" messages from it
+// and for theme changes to it. Messages from the iframe are narrowed here before the extension
+// acts on them.
 
 export interface OpenRequest {
   /** `file://` URL or absolute path, as the dashboard has it. */
@@ -9,13 +10,15 @@ export interface OpenRequest {
   readonly column: number;
 }
 
+const isFiniteNumber = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value);
+
 /** `{ type: 'xray.open', url, line, column }` from the webview → request; null for anything else. */
 export function parseOpenRequest(value: unknown): OpenRequest | null {
   if (typeof value !== 'object' || value === null || Reflect.get(value, 'type') !== 'xray.open') return null;
   const url: unknown = Reflect.get(value, 'url');
   const line: unknown = Reflect.get(value, 'line');
   const column: unknown = Reflect.get(value, 'column');
-  if (typeof url !== 'string' || url === '' || typeof line !== 'number' || typeof column !== 'number') return null;
+  if (typeof url !== 'string' || url === '' || !isFiniteNumber(line) || !isFiniteNumber(column)) return null;
   return { url, line: Math.max(1, Math.floor(line)), column: Math.max(1, Math.floor(column)) };
 }
 
@@ -32,16 +35,55 @@ export function localFile(url: string): string | null {
   return url.startsWith('/') || /^[A-Za-z]:[\\/]/.test(url) ? url : null;
 }
 
+export type Theme = 'light' | 'dark';
+
+/** Sent to the webview on a theme change; its script hands it on to the dashboard. */
+export interface ThemeMessage {
+  readonly type: 'xray.theme';
+  readonly theme: Theme;
+}
+
+/** Hosts the CLI's dashboard accepts without being told: a port forwarded to one of them needs nothing. */
+const LOCAL_HOSTS: ReadonlySet<string> = new Set(['127.0.0.1', 'localhost', '[::1]']);
+
+/**
+ * The `Host` a browser will send to the dashboard once VS Code forwarded its port (Codespaces,
+ * remote tunnels), for `XRAY_DASHBOARD_HOST`; null when the address stays local.
+ */
+export function forwardedHost(authority: string): string | null {
+  const host = authority.toLowerCase();
+  const name = host.startsWith('[') ? host.slice(0, host.indexOf(']') + 1) : host.split(':')[0] ?? '';
+  return name === '' || LOCAL_HOSTS.has(name) ? null : host;
+}
+
+export interface DashboardUrlArgs {
+  /** `http://127.0.0.1:<port>` of the CLI's dashboard server. */
+  readonly base: string;
+  readonly token: string;
+  readonly theme: Theme;
+}
+
+/** The dashboard as the webview frames it; the webview's script adds `parent` (its own origin). */
+export function dashboardUrl({ base, token, theme }: DashboardUrlArgs): string {
+  const query = new URLSearchParams({ token, host: 'vscode', theme });
+  return `${base}/?${query.toString()}`;
+}
+
 export interface DashboardPage {
-  /** The dashboard URL the webview can reach (after `asExternalUri`), token included. */
+  /** `dashboardUrl` as the webview can reach it (after `asExternalUri`). */
   readonly src: string;
-  /** Its origin, the only one whose messages are relayed. */
+  /** Its origin: the only one whose messages are relayed, and the only one messages go to. */
   readonly origin: string;
   readonly nonce: string;
 }
 
 function attribute(value: string): string {
   return value.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+}
+
+/** A JS literal safe inside `<script>`. */
+function literal(value: string): string {
+  return JSON.stringify(value).replace(/</g, '\\u003c');
 }
 
 export function dashboardHtml({ src, origin, nonce }: DashboardPage): string {
@@ -54,12 +96,22 @@ export function dashboardHtml({ src, origin, nonce }: DashboardPage): string {
 <style>html, body, iframe { margin: 0; padding: 0; border: 0; width: 100%; height: 100%; overflow: hidden; }</style>
 </head>
 <body>
-<iframe src="${attribute(src)}" title="xray dashboard"></iframe>
+<iframe id="dashboard" title="xray dashboard"></iframe>
 <script nonce="${attribute(nonce)}">
 const vscode = acquireVsCodeApi();
+const origin = ${literal(origin)};
+const frame = document.getElementById('dashboard');
+const src = new URL(${literal(src)});
+src.searchParams.set('parent', location.origin);
+frame.src = src.toString();
 window.addEventListener('message', (event) => {
-  if (event.origin !== ${JSON.stringify(origin)}) return;
-  if (event.data && event.data.type === 'xray.open') vscode.postMessage(event.data);
+  const data = event.data;
+  if (typeof data !== 'object' || data === null) return;
+  if (event.source === frame.contentWindow) {
+    if (event.origin === origin && data.type === 'xray.open') vscode.postMessage({ type: data.type, url: data.url, line: data.line, column: data.column });
+    return;
+  }
+  if (data.type === 'xray.theme' && (data.theme === 'light' || data.theme === 'dark')) frame.contentWindow.postMessage({ type: 'xray.theme', theme: data.theme }, origin);
 });
 </script>
 </body>

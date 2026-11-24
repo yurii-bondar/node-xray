@@ -4,10 +4,10 @@
 import { createReadStream } from 'node:fs';
 import { access } from 'node:fs/promises';
 import readline from 'node:readline';
-import { HOST_CONNECTION, parseStreamMessage, recordPayload, type SourceReport } from '@node-xray/core';
+import { decodeStreamMessage, HOST_CONNECTION, recordPayload, type SourceReport } from '@node-xray/core';
 import type { ReplayOptions } from './args.js';
 import type { OpenLink } from './collector.js';
-import { openSession, waitForInterrupt } from './session.js';
+import { Interrupts, openSession } from './session.js';
 
 export class ReplayError extends Error {
   override name = 'ReplayError';
@@ -21,6 +21,21 @@ export interface ReplayResult {
 }
 
 export async function replay(options: ReplayOptions, stderr: NodeJS.WritableStream = process.stderr): Promise<ReplayResult> {
+  const interrupts = new Interrupts();
+  try {
+    return await replayWith({ options, stderr, interrupts });
+  } finally {
+    interrupts.dispose();
+  }
+}
+
+interface ReplayArgs {
+  readonly options: ReplayOptions;
+  readonly stderr: NodeJS.WritableStream;
+  readonly interrupts: Interrupts;
+}
+
+async function replayWith({ options, stderr, interrupts }: ReplayArgs): Promise<ReplayResult> {
   try {
     await access(options.file);
   } catch {
@@ -33,6 +48,8 @@ export async function replay(options: ReplayOptions, stderr: NodeJS.WritableStre
     let records = 0;
     const lines = readline.createInterface({ input: createReadStream(options.file, 'utf8'), crlfDelay: Number.POSITIVE_INFINITY });
     for await (const line of lines) {
+      // Ctrl+C during a long file: summarise what was read so far.
+      if (interrupts.count > 0) break;
       if (line.trim() === '') continue;
       const payload = recordPayload(line);
       if (payload === null) {
@@ -40,8 +57,14 @@ export async function replay(options: ReplayOptions, stderr: NodeJS.WritableStre
         continue;
       }
       records++;
+      if ('closed' in payload) {
+        // As live: the collector frees what it kept for the connection beyond the most recent ended ones.
+        links.get(payload.connection)?.closed();
+        links.delete(payload.connection);
+        continue;
+      }
       if (payload.connection === HOST_CONNECTION) {
-        const parsed = parseStreamMessage(JSON.parse(payload.raw) as unknown);
+        const parsed = decodeStreamMessage(payload.raw);
         if (parsed.ok && parsed.value.type === 'host') session.collector.applyHost(parsed.value);
         else skipped++;
         continue;
@@ -54,14 +77,17 @@ export async function replay(options: ReplayOptions, stderr: NodeJS.WritableStre
       }
       link.line(payload.raw);
     }
+    lines.close();
     for (const link of links.values()) link.closed();
     if (records === 0) throw new ReplayError(`${options.file} has no xray records (is it a --record file?)`);
-    stderr.write(`xray: replayed ${records} records from ${options.file}${skipped > 0 ? ` (${skipped} lines skipped)` : ''}\n`);
+    const stopped = interrupts.count > 0;
+    stderr.write(`xray: replayed ${records} records from ${options.file}${skipped > 0 ? ` (${skipped} lines skipped)` : ''}${stopped ? ', stopped by an interrupt' : ''}\n`);
 
-    if (session.dashboard !== null) {
+    if (session.dashboard !== null && !stopped) {
       stderr.write('xray: the dashboard stays up. Ctrl+C to finish.\n');
-      await waitForInterrupt();
+      await interrupts.wait();
     }
+    interrupts.finishing({ stderr });
     const outcome = await session.finish();
     return { exitCode: outcome.failed ? 1 : 0, sources: outcome.sources, skipped };
   } finally {

@@ -1,12 +1,30 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { cpuFlame, encodeRecord, toLoopEvents, groupIterations, type CpuProfile, type GcEvent, type Hello, type InsightSummary, type LoopTraceEvent } from '@node-xray/core';
-import { findByPath, frameKind, layoutFlame, nodeKey } from '../src/flame-layout.js';
-import { hitTest, iterationDetail, layoutLane } from '../src/lane-layout.js';
+import {
+  cpuFlame,
+  encodeClosedRecord,
+  encodeRecord,
+  toLoopEvents,
+  groupIterations,
+  Timeline,
+  toSourceId,
+  type CpuProfile,
+  type GcEvent,
+  type Hello,
+  type InsightSummary,
+  type Iteration,
+  type LoopTraceEvent,
+  type Sample,
+  type SourceId,
+} from '@node-xray/core';
+import { findByPath, frameKind, layoutFlame, nodeKey, stackAlong } from '../src/flame-layout.js';
+import { parseTheme, parseThemeMessage } from '../src/host.js';
+import { hitTest, iterationDetail, layoutLane, stepIteration } from '../src/lane-layout.js';
 import { OriginalsCache, parseOriginals } from '../src/originals.js';
 import { insightLevel, insightPage, pageAlerts, parseRoute } from '../src/nav.js';
-import { columns, gcByKind, markerTimes, pauseHistogram, shortIoKey, sparkPath } from '../src/series.js';
-import { parseStatus, sourceLabel, Store } from '../src/store.js';
+import { columns, gcByKind, gcCoverageStart, gcLevel, keptSpan, markerTimes, pauseHistogram, PointCache, recentTotal, shortIoKey, sparkPath } from '../src/series.js';
+import { lastResult, latestTime, LIVE, snapshotOf } from '../src/snapshot.js';
+import { headerState, MAX_ENDED_SOURCES, parseStatus, sourceLabel, Store } from '../src/store.js';
 
 const hello: Hello = {
   type: 'hello',
@@ -25,6 +43,38 @@ const hello: Hello = {
   agentScript: '',
 };
 
+function toId(pid: number, threadId = 0): SourceId {
+  return toSourceId(pid, threadId);
+}
+
+/** A quiet sample at `t`; `gc` pauses as given. */
+function sample(t: number, gc: Sample['gc'] = []): Sample {
+  return {
+    type: 'sample',
+    t,
+    cpu: { user: 0, system: 0 },
+    loop: { idle: 0, active: 0 },
+    loopDelay: { min: 0, max: 1, mean: 0.2, stddev: 0.1, p50: 0.1, p90: 0.5, p99: 0.9 },
+    uv: null,
+    memory: { rss: 100, heapTotal: 60, heapUsed: 40, external: 2, arrayBuffers: 1 },
+    heap: { limit: 4096, totalAvailable: 4000, malloced: 1, peakMalloced: 2, nativeContexts: 1, detachedContexts: 0 },
+    heapSpaces: [],
+    gc,
+    resources: [],
+    rusage: { maxRss: 120, minorFaults: 0, majorFaults: 0, voluntarySwitches: 0, involuntarySwitches: 0, fsReads: 0, fsWrites: 0 },
+    system: { free: 4096, available: null, limit: null, processSwap: null, loadAvg1: 0.5 },
+    overheadUs: 0,
+  };
+}
+
+/** A timeline with frames ending at 1000, 2000, … `seconds` s; `pauseAt` adds a GC pause of 100 ms to that second's frame. */
+function timelineOf(seconds: number, pauseAt: readonly number[] = []): Timeline {
+  const timeline = new Timeline();
+  timeline.apply({ ...hello, intervalMs: 1000 });
+  for (let s = 0; s <= seconds; s++) timeline.apply(sample(s * 1000, pauseAt.includes(s) ? [{ start: s * 1000 - 500, duration: 100, kind: 'minor' }] : []));
+  return timeline;
+}
+
 describe('Store', () => {
   it('keeps one timeline per connection and names sources by hello', () => {
     const store = new Store();
@@ -42,6 +92,44 @@ describe('Store', () => {
     store.reset();
     assert.equal(store.sources.size, 0);
     assert.ok(store.revision > revision);
+  });
+
+  it('marks a source ended when its connection closes and keeps only the newest ended ones', () => {
+    const store = new Store();
+    const helloOf = (pid: number) => JSON.stringify({ ...hello, pid });
+    store.applyLine(encodeRecord(1, helloOf(1)));
+    store.applyLine(encodeRecord(2, JSON.stringify({ ...hello, pid: 1, threadId: 1 })));
+    store.applyLine(encodeClosedRecord(1));
+    assert.equal(store.sources.get(toId(1))?.ended, true);
+    assert.equal(store.sources.get(toId(1, 1))?.ended, false);
+    assert.equal(store.defaultSource()?.id, toId(1, 1), 'a live source comes before an ended main thread');
+    store.applyLine(encodeClosedRecord(2));
+    assert.equal(store.defaultSource()?.id, toId(1, 1), 'then the newest ended one');
+    store.applyLine(encodeClosedRecord(99));
+    for (let pid = 2; pid <= MAX_ENDED_SOURCES + 3; pid++) {
+      store.applyLine(encodeRecord(pid + 10, helloOf(pid)));
+      store.applyLine(encodeClosedRecord(pid + 10));
+    }
+    store.applyLine(encodeRecord(100, helloOf(1000)));
+    assert.equal(store.sources.size, MAX_ENDED_SOURCES + 1, 'the live source is always kept');
+    assert.equal(store.sources.has(toId(1)), false, 'the oldest ended ones are dropped');
+    assert.equal(store.sources.has(toId(MAX_ENDED_SOURCES + 3)), true);
+    assert.equal(store.defaultSource()?.id, toId(1000));
+    assert.equal(store.rejected, 0);
+  });
+
+  it('says reconnecting while the stream is lost, and that commands cannot be sent', () => {
+    const running = parseStatus('{"state":"running","command":"node a.js"}');
+    assert.deepEqual(headerState(running, 'open'), { text: 'live · node a.js', tone: 'live', live: true });
+    assert.deepEqual(headerState(running, 'lost'), { text: 'reconnecting… · node a.js', tone: 'done', live: false });
+    assert.deepEqual(headerState(null, 'connecting'), { text: 'connecting…', tone: 'neutral', live: true });
+    assert.equal(headerState(parseStatus('{"state":"replay","command":"r.xray.jsonl"}'), 'lost').text, 'r.xray.jsonl');
+    assert.equal(headerState(parseStatus('{"state":"exited","command":"x","code":1}'), 'open').live, false);
+    const store = new Store();
+    const revision = store.revision;
+    store.setConnection('lost');
+    store.setConnection('lost');
+    assert.equal(store.revision, revision + 1);
   });
 
   it('reads the run status', () => {
@@ -166,6 +254,16 @@ describe('flame layout', () => {
     const again = cpuFlame(profile, { start: 1, end: 2 });
     assert.equal(findByPath(again.root, [nodeKey(handle)])?.name, 'handle');
     assert.equal(findByPath(again.root, ['nope']), null);
+    assert.equal(findByPath(again.root, []), again.root);
+  });
+
+  it('lists the frames a zoom path passes through, stopping where the tree changed', () => {
+    const handle = tree.root.children[0];
+    const read = handle?.children[0];
+    assert.ok(handle && read);
+    assert.deepEqual(stackAlong(tree.root, [nodeKey(handle), nodeKey(read)]).map((n) => n.name), ['handle', 'readFile']);
+    assert.deepEqual(stackAlong(tree.root, [nodeKey(handle), 'gone', nodeKey(read)]).map((n) => n.name), ['handle']);
+    assert.deepEqual(stackAlong(tree.root, []), []);
   });
 
   it('colours by where the code lives', () => {
@@ -235,7 +333,7 @@ describe('navigation', () => {
     assert.equal(insightPage('gc-pressure'), 'gc');
     assert.equal(insightPage('fs-blocking'), 'io');
     assert.equal(insightLevel('http-slow'), 'warn');
-    const summary = (kind: InsightSummary['kind']): InsightSummary => ({ kind, count: 1, worst: { kind: 'detached-contexts', t: 0, count: 1 }, culprit: null });
+    const summary = (kind: InsightSummary['kind']): InsightSummary => ({ kind, count: 1, worst: { kind: 'detached-contexts', t: 0, count: 1 }, culprit: null, culpritStack: null });
     const alerts = pageAlerts([summary('http-slow'), summary('http-errors'), summary('heap-growth'), summary('http-slow')]);
     assert.equal(alerts.get('http'), 'bad');
     assert.equal(alerts.get('memory'), 'warn');
@@ -270,5 +368,100 @@ describe('GC summaries', () => {
   it('counts pauses per bucket, the last one open-ended', () => {
     assert.deepEqual(pauseHistogram(events), [1, 1, 1, 0, 0, 1, 1]);
     assert.deepEqual(pauseHistogram([]), [0, 0, 0, 0, 0, 0, 0]);
+  });
+});
+
+describe('recent totals', () => {
+  it('sums the frames of the last span, without the frame that ends at its start', () => {
+    const frames = timelineOf(20, [10, 11, 20]).frames();
+    assert.deepEqual(recentTotal(frames, { ms: 10_000, pick: (f) => f.gc.pause }), { total: 200, coveredMs: 10_000 }, 'the frame ending at 10 s is outside (10, 20]');
+    assert.deepEqual(recentTotal(frames.slice(0, 3), { ms: 10_000, pick: (f) => f.gc.count }), { total: 0, coveredMs: 3000 }, 'a young run covers less');
+    assert.deepEqual(recentTotal([], { ms: 10_000, pick: (f) => f.gc.pause }), { total: 0, coveredMs: 0 });
+    assert.equal(keptSpan(frames), 20_000);
+  });
+
+  it('rates GC time by one rule', () => {
+    assert.equal(gcLevel(0.2), 'bad');
+    assert.equal(gcLevel(0.05), 'warn');
+    assert.equal(gcLevel(0.01), 'ok');
+  });
+
+  it('says when the kept GC events start inside the window', () => {
+    const events: GcEvent[] = [5000, 6000, 7000].map((start) => ({ start, duration: 1, kind: 'minor' }));
+    assert.equal(gcCoverageStart(events, { from: 1000, capacity: 3 }), 5000, 'the ring is full: older ones were dropped');
+    assert.equal(gcCoverageStart(events, { from: 1000, capacity: 10 }), null, 'nothing was dropped');
+    assert.equal(gcCoverageStart(events, { from: 6000, capacity: 3 }), null, 'they cover the window');
+    assert.equal(gcCoverageStart([], { from: 0, capacity: 3 }), null);
+  });
+});
+
+describe('PointCache', () => {
+  it('derives each window once and only the windows needed', () => {
+    let derived = 0;
+    const cache = new PointCache((w: { readonly end: number }) => {
+      derived++;
+      return { t: w.end };
+    });
+    const windows = [1000, 2000, 3000, 4000, 5000].map((end) => ({ end }));
+    assert.deepEqual(cache.since(windows, 4000, 1).map((p) => p.t), [4000, 5000]);
+    assert.deepEqual(cache.since(windows, Number.POSITIVE_INFINITY, 3).map((p) => p.t), [3000, 4000, 5000], 'at least the last `keep`');
+    assert.equal(derived, 3);
+    assert.equal(cache.since(windows, 0, 0).length, 5);
+    assert.equal(derived, 5);
+  });
+});
+
+describe('snapshot', () => {
+  it('cuts every history at the pause and keeps it while paused', () => {
+    const timeline = timelineOf(10, [3, 8]);
+    const paused = snapshotOf(timeline, 5000);
+    assert.deepEqual(paused.frames.map((f) => f.t), [1000, 2000, 3000, 4000, 5000]);
+    assert.deepEqual(paused.gcEvents.map((e) => e.start), [2500]);
+    timeline.apply(sample(11_000));
+    assert.equal(snapshotOf(timeline, 5000), paused, 'new data does not change a paused view');
+    const live = snapshotOf(timeline, LIVE);
+    assert.equal(live.latest?.t, 11_000);
+    assert.equal(snapshotOf(timeline, LIVE), live, 'the same until the next message');
+    timeline.apply(sample(12_000));
+    assert.notEqual(snapshotOf(timeline, LIVE), live);
+    assert.equal(latestTime(timeline), 12_000);
+    assert.equal(latestTime(new Timeline()), Number.NEGATIVE_INFINITY);
+  });
+
+  it('remembers the last result per arguments', () => {
+    let calls = 0;
+    const double = lastResult((a: object, n: number) => {
+      calls++;
+      return { a, n: n * 2 };
+    });
+    const key = {};
+    assert.equal(double(key, 2), double(key, 2));
+    assert.equal(calls, 1);
+    double({}, 2);
+    double(key, 3);
+    assert.equal(calls, 3);
+  });
+});
+
+describe('iteration keys', () => {
+  const iterations = [1, 2, 3].map((index) => ({ index }) as Iteration);
+  it('steps from the selected iteration, or the newest, and stops at the ends', () => {
+    assert.equal(stepIteration(iterations, null, -1)?.index, 2);
+    assert.equal(stepIteration(iterations, 1, -1)?.index, 1);
+    assert.equal(stepIteration(iterations, 2, 1)?.index, 3);
+    assert.equal(stepIteration(iterations, 2, Number.NEGATIVE_INFINITY)?.index, 1);
+    assert.equal(stepIteration(iterations, 2, Number.POSITIVE_INFINITY)?.index, 3);
+    assert.equal(stepIteration([], null, 1), undefined);
+  });
+});
+
+describe('VS Code host', () => {
+  it('takes only a light or dark theme message', () => {
+    assert.equal(parseTheme('light'), 'light');
+    assert.equal(parseTheme('sepia'), null);
+    assert.equal(parseThemeMessage({ type: 'xray.theme', theme: 'dark' }), 'dark');
+    assert.equal(parseThemeMessage({ type: 'xray.open', theme: 'dark' }), null);
+    assert.equal(parseThemeMessage({ type: 'xray.theme', theme: 'blue' }), null);
+    assert.equal(parseThemeMessage('xray.theme'), null);
   });
 });

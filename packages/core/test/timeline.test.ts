@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import type { CpuProfile } from '../src/cdp.js';
-import { decodeStreamMessage } from '../src/protocol.js';
+import { decodeStreamMessage, type StreamMessage } from '../src/protocol.js';
 import { encodeLine, LineDecoder } from '../src/ndjson.js';
 import { Timeline } from '../src/timeline.js';
 import { callFrame, hello, sample, wireSample } from './fixtures.js';
@@ -64,6 +64,35 @@ describe('Timeline', () => {
     assert.equal(timeline.loopEvents()[0]?.phase, 'timers');
     assert.equal(timeline.traceWindows()[0]?.byCategory.promise.created, 5);
     assert.equal(timeline.queues()[0]?.pending, 4);
+  });
+
+  it('keeps every CPU window in the whole-run tree', () => {
+    const timeline = new Timeline({ cpuWindows: 2 });
+    assert.equal(timeline.cpuFlameTotal(), null);
+    for (let i = 0; i < 3; i++) timeline.apply({ type: 'cpu-profile', start: i * 1000, end: (i + 1) * 1000, profile });
+    const total = timeline.cpuFlameTotal();
+    assert.equal(total?.root.total, 9);
+    assert.deepEqual([total?.start, total?.end], [0, 3000]);
+    assert.equal(timeline.cpuFlameTotal(), total, 'finished once until the next window');
+  });
+
+  it('starts the queues over on hello and on a new trace session', () => {
+    const timeline = new Timeline();
+    const trace = (start: number, created: number): StreamMessage => ({
+      type: 'loop-trace',
+      start,
+      end: start + 250,
+      events: [],
+      counters: [{ resource: 'Timeout', created, executed: 0, settled: 0, busy: 0 }],
+      dropped: 0,
+    });
+    timeline.apply(trace(0, 2));
+    timeline.apply(trace(250, 1));
+    assert.equal(timeline.queues()[0]?.pending, 3, 'one session');
+    timeline.apply(trace(9000, 1));
+    assert.equal(timeline.queues()[0]?.pending, 1, 'a new session');
+    timeline.apply(hello);
+    assert.deepEqual(timeline.queues(), []);
   });
 
   it('runs the wire path end to end: NDJSON → parse → frames', () => {

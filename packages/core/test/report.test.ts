@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import type { CpuProfile } from '../src/cdp.js';
-import { buildHostReport, buildReport, stallCulprit, summarizeInsights } from '../src/report.js';
+import { culpritWindow, insightTime, stallCulprit, summarizeInsights } from '../src/findings.js';
+import { buildHostReport, buildReport } from '../src/report.js';
 import { cpuFlame } from '../src/flame.js';
-import { Timeline } from '../src/timeline.js';
+import { Timeline, type FindingsSpan } from '../src/timeline.js';
 import { callFrame, hello, MiB, sample } from './fixtures.js';
 
 const profile: CpuProfile = {
@@ -85,10 +86,51 @@ describe('stall culprits', () => {
   };
 
   it('picks the busiest function of the window overlapping the stall', () => {
-    const windows = [cpuFlame(profile, { start: 0, end: 1000 }), cpuFlame(blocking, { start: 1000, end: 2000 })];
-    assert.equal(stallCulprit(windows, 1900, 1000)?.name, 'blockingReport');
-    assert.equal(stallCulprit(windows, 900, 1000)?.name, 'render');
-    assert.equal(stallCulprit([], 900, 1000), null);
+    const windows = [culpritWindow(cpuFlame(profile, { start: 0, end: 1000 })), culpritWindow(cpuFlame(blocking, { start: 1000, end: 2000 }))];
+    assert.equal(stallCulprit(windows, { t: 1900, spanMs: 1000 }).culprit?.name, 'blockingReport');
+    assert.equal(stallCulprit(windows, { t: 900, spanMs: 1000 }).culprit?.name, 'render');
+    assert.equal(stallCulprit(windows, { t: 1300, spanMs: 1000 }).culprit?.name, 'render', 'most of the span lies in the first window');
+    assert.deepEqual(stallCulprit([], { t: 900, spanMs: 1000 }), { culprit: null, culpritStack: null });
+  });
+
+  it('finds the culprit of an early stall in a long run and looks back over the whole stretched frame', () => {
+    const timeline = new Timeline({ cpuWindows: 2 });
+    timeline.apply({ ...hello, intervalMs: 1000 });
+    timeline.apply(sample(1000));
+    // The stall delayed the tick: the frame covers 2.5 s, most of it in the blocking window before the last second.
+    timeline.apply(sample(3500, { loopDelay: { min: 0, max: 1400, mean: 5, stddev: 30, p50: 0, p90: 1, p99: 1400 } }));
+    // [t - interval, t] would overlap the second window more; the whole frame overlaps the first.
+    timeline.apply({ type: 'cpu-profile', start: 1000, end: 2800, profile: blocking });
+    timeline.apply({ type: 'cpu-profile', start: 2800, end: 4000, profile });
+    for (let t = 4000; t < 30_000; t += 1000) timeline.apply({ type: 'cpu-profile', start: t, end: t + 1000, profile });
+    assert.equal(timeline.cpuWindows().length, 2, 'the flame graph keeps only the last windows');
+    const report = buildReport(timeline);
+    assert.equal(report?.insights.find((i) => i.kind === 'loop-stall')?.culprit?.name, 'blockingReport');
+    assert.deepEqual(
+      report?.hotFunctions.map((f) => [f.name, f.self]),
+      [
+        ['render', 9 * 27],
+        ['blockingReport', 30],
+      ],
+      'hot functions cover the whole run',
+    );
+  });
+
+  it('builds findings and the report once per timeline version', () => {
+    const timeline = new Timeline();
+    timeline.apply(hello);
+    timeline.apply(sample(1000));
+    const version = timeline.version;
+    assert.equal(timeline.insights(), timeline.insights());
+    assert.equal(timeline.findings(), timeline.findings());
+    assert.notEqual(timeline.findings({ loopStallMs: 1 }), timeline.findings());
+    const report = buildReport(timeline);
+    assert.equal(buildReport(timeline), report);
+    assert.notEqual(buildReport(timeline, { hotLimit: 3 }), report);
+    timeline.apply(sample(2000));
+    assert.equal(timeline.version, version + 1);
+    assert.notEqual(buildReport(timeline), report);
+    assert.equal(buildReport(timeline)?.frames, 1);
   });
 
   it('names the culprit of a non-GC stall in the report', () => {
@@ -97,9 +139,26 @@ describe('stall culprits', () => {
     timeline.apply(sample(1000));
     timeline.apply(sample(2000, { loopDelay: { min: 0, max: 300, mean: 5, stddev: 30, p50: 0, p90: 1, p99: 290 } }));
     timeline.apply({ type: 'cpu-profile', start: 1000, end: 2000, profile: blocking });
-    const stall = buildReport(timeline)?.insights.find((i) => i.kind === 'loop-stall');
+    const stall = timeline.findings().find((i) => i.kind === 'loop-stall');
+    assert.deepEqual(buildReport(timeline)?.insights, timeline.findings());
     assert.equal(stall?.culprit?.name, 'blockingReport');
     assert.equal(stall?.culprit?.line, 9);
+    assert.deepEqual(stall?.culpritStack?.frames.map((f) => f.name), ['blockingReport']);
+    assert.equal(stall?.culpritStack?.share, 1);
+  });
+
+  it('counts only the findings in a span, with the worst of those', () => {
+    const timeline = new Timeline();
+    timeline.apply(hello);
+    const stall = (max: number) => ({ loopDelay: { min: 0, max, mean: 5, stddev: 30, p50: 0, p90: 1, p99: max } });
+    for (const t of [1000, 2000, 3000, 4000, 5000]) timeline.apply(sample(t, t === 2000 ? stall(300) : t === 4000 ? stall(500) : {}));
+    const stalls = (span: FindingsSpan) => timeline.findings({}, span).find((i) => i.kind === 'loop-stall');
+    assert.deepEqual([stalls({})?.count, stalls({})?.worst], [2, timeline.insights().find((i) => i.kind === 'loop-stall' && i.t === 4000)]);
+    assert.equal(stalls({ since: 3000 })?.count, 1);
+    const early = stalls({ until: 3000 });
+    assert.deepEqual([early?.count, early === undefined ? null : insightTime(early.worst)], [1, 2000]);
+    assert.equal(stalls({ since: 4500 }), undefined);
+    assert.equal(insightTime({ kind: 'heap-growth', trend: { from: 1, to: 9, bytesPerMin: 1, r2: 1 } }), 9);
   });
 });
 

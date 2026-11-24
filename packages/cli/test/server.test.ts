@@ -5,10 +5,10 @@ import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { after, before, describe, it } from 'node:test';
-import { encodeLine, LineDecoder, parseRecord, type StreamMessage } from '@node-xray/core';
+import { decodeStreamMessage, encodeLine, LineDecoder, type StreamMessage } from '@node-xray/core';
 import { Backlog } from '../src/backlog.js';
-import { Collector } from '../src/collector.js';
-import { DashboardServer, parseCommandRequest, parseResolveRequest } from '../src/server.js';
+import { Collector, MAX_ENDED_SOURCES } from '../src/collector.js';
+import { DashboardServer, hostAllowed, parseCommandRequest, parseExtraHost, parseResolveRequest } from '../src/server.js';
 import { SourceMapResolver } from '../src/sourcemaps.js';
 
 const hello = {
@@ -29,9 +29,9 @@ const hello = {
 } as const;
 
 function message(raw: string): StreamMessage {
-  const parsed = parseRecord(`{"c":1,"m":${raw}}`);
+  const parsed = decodeStreamMessage(raw);
   if (!parsed.ok) assert.fail(parsed.error);
-  return parsed.value.message;
+  return parsed.value;
 }
 
 describe('Backlog', () => {
@@ -47,6 +47,69 @@ describe('Backlog', () => {
     const records = backlog.records();
     assert.ok(records[0]?.startsWith('{"c":0,'), 'host first');
     assert.ok(records[1]?.includes('"hello"'));
+  });
+
+  it('marks ended connections and forgets dropped ones', () => {
+    const backlog = new Backlog();
+    const h = JSON.stringify(hello);
+    backlog.add(1, h, message(h));
+    backlog.add(2, h, message(h));
+    backlog.closed(1);
+    assert.deepEqual(backlog.records(), [`{"c":1,"m":${h}}`, '{"c":1,"closed":true}', `{"c":2,"m":${h}}`]);
+    backlog.drop(1);
+    assert.deepEqual(backlog.records(), [`{"c":2,"m":${h}}`]);
+  });
+});
+
+describe('Collector', () => {
+  it('keeps live sources and the most recent ended ones, and says how many it dropped', () => {
+    const collector = new Collector({ startupCommands: [] });
+    const events: string[] = [];
+    collector.onRecord({ record: () => undefined, closed: (c) => events.push(`closed ${c}`), dropped: (c) => events.push(`dropped ${c}`) });
+    const live = collector.open({ send: () => undefined, close: () => undefined });
+    live.line(JSON.stringify({ ...hello, threadId: 100 }));
+    const total = MAX_ENDED_SOURCES + 4;
+    for (let i = 0; i < total; i++) {
+      const link = collector.open({ send: () => undefined, close: () => undefined });
+      link.line(JSON.stringify({ ...hello, threadId: i + 1 }));
+      link.closed();
+      link.closed(); // twice is once
+    }
+    assert.equal(collector.sources.size, MAX_ENDED_SOURCES + 1, 'the live one and the last ended ones');
+    assert.ok(collector.sources.has('4242:100' as never));
+    assert.ok(!collector.sources.has('4242:1' as never), 'the oldest ended one went first');
+    assert.ok(collector.sources.has(`4242:${total}` as never));
+    assert.equal(collector.droppedSources, 4);
+    assert.equal(events.filter((e) => e.startsWith('closed')).length, total);
+    assert.deepEqual(
+      events.filter((e) => e.startsWith('dropped')),
+      [2, 3, 4, 5].map((c) => `dropped ${c}`),
+    );
+  });
+});
+
+describe('dashboard Host check', () => {
+  it('takes one exact extra host, validated', () => {
+    assert.deepEqual(parseExtraHost('Xray-7000.app.github.dev'), { name: 'xray-7000.app.github.dev', port: null });
+    assert.deepEqual(parseExtraHost('box.local:8443'), { name: 'box.local', port: '8443' });
+    for (const bad of ['*.app.github.dev', 'a b', 'http://x.dev', 'x.dev:99999', 'x.dev:', '-x.dev', 'x..dev', 'x.dev/path', '']) {
+      assert.equal(parseExtraHost(bad), null, bad);
+    }
+  });
+
+  it('accepts local names on any port, and the extra host as given', () => {
+    const extra = parseExtraHost('xray-7000.app.github.dev');
+    const withPort = parseExtraHost('box.local:8443');
+    assert.equal(hostAllowed('127.0.0.1:5000', null), true);
+    assert.equal(hostAllowed('[::1]:5000', null), true);
+    assert.equal(hostAllowed('xray-7000.app.github.dev', null), false);
+    assert.equal(hostAllowed('XRAY-7000.app.github.dev', extra), true);
+    assert.equal(hostAllowed('xray-7000.app.github.dev:443', extra), true);
+    assert.equal(hostAllowed('evil-xray-7000.app.github.dev', extra), false);
+    assert.equal(hostAllowed('xray-7000.app.github.dev.evil.com', extra), false);
+    assert.equal(hostAllowed('box.local:8443', withPort), true);
+    assert.equal(hostAllowed('box.local:8444', withPort), false);
+    assert.equal(hostAllowed('box.local', withPort), false);
   });
 });
 
@@ -82,7 +145,7 @@ describe('DashboardServer', () => {
     collector = new Collector({ startupCommands: [] });
     const socketPath = path.join(dir, 'agent.sock');
     await collector.listen(socketPath);
-    server = new DashboardServer({ collector, resolver: new SourceMapResolver(async () => ''), staticDir: dir, port: 0, status: { state: 'running', command: 'node app.js' }, token: 'given-token-0123456789' });
+    server = new DashboardServer({ collector, resolver: new SourceMapResolver(async () => ''), staticDir: dir, port: 0, status: { state: 'running', command: 'node app.js' }, token: 'given-token-0123456789', extraHost: parseExtraHost('xray-7000.app.github.dev') });
     const url = await server.start();
     base = url.slice(0, url.indexOf('/?'));
 
@@ -139,6 +202,9 @@ describe('DashboardServer', () => {
     assert.equal((await request(`/api/stream?token=wrong`)).status, 401);
     assert.equal((await request('/', { host: 'evil.example:80' })).status, 403);
     assert.equal((await request('/', { host: 'localhost:61000' })).status, 200, 'a forwarded port is still local');
+    assert.equal((await request('/', { host: 'xray-7000.app.github.dev' })).status, 200, 'the extra host');
+    assert.equal((await request('/api/stream', { host: 'xray-7000.app.github.dev' })).status, 401, 'still needs the token');
+    assert.equal((await request(`/api/status?token=${server.token}`, { host: 'other.app.github.dev' })).status, 403);
     assert.equal(server.token, 'given-token-0123456789', 'the token it was given');
   });
 
@@ -165,6 +231,21 @@ describe('DashboardServer', () => {
     assert.deepEqual(received, ['{"type":"loop-trace-stop"}']);
   });
 
+  it('answers the run status as JSON', async () => {
+    assert.equal((await request('/api/status')).status, 401);
+    const answer = await new Promise<{ type: string | undefined; body: string }>((resolve, reject) => {
+      http.get(`${base}/api/status?token=${server.token}`, (res) => {
+        let body = '';
+        res.setEncoding('utf8').on('data', (c: string) => (body += c));
+        res.on('end', () => resolve({ type: res.headers['content-type'], body }));
+      }).on('error', reject);
+    });
+    assert.deepEqual(answer, { type: 'application/json', body: '{"state":"running","command":"node app.js"}' });
+    server.setStatus({ state: 'exited', command: 'node app.js', code: 3 });
+    assert.deepEqual(await request(`/api/status?token=${server.token}`), { status: 200, body: '{"state":"exited","command":"node app.js","code":3}' });
+    server.setStatus({ state: 'running', command: 'node app.js' });
+  });
+
   it('serves per-line CPU samples (none yet)', async () => {
     assert.deepEqual(await request(`/api/lines?token=${server.token}`), { status: 200, body: '{"work":0,"files":[]}' });
   });
@@ -177,5 +258,94 @@ describe('DashboardServer', () => {
     assert.deepEqual(none, { status: 404, body: 'no CPU profile yet' });
     assert.equal((await request(`/api/export?token=${server.token}&source=1:0&kind=cpu`)).status, 404);
     assert.equal((await request(`/api/export?source=4242:0&kind=cpu`)).status, 401);
+  });
+});
+
+describe('DashboardServer backlog streaming', () => {
+  const LIMIT = 64 * 1024;
+  let collector: Collector;
+  let server: DashboardServer;
+  let streamUrl = '';
+  const big = 'x'.repeat(20_000);
+  let pid = 1;
+
+  /** A source whose hello is about 20 KB. */
+  function source(size: 'big' | 'small'): void {
+    const link = collector.open({ send: () => undefined, close: () => undefined });
+    link.line(JSON.stringify({ ...hello, pid: pid++, argv: ['node', size === 'big' ? big : 'small'] }));
+  }
+
+  before(async () => {
+    collector = new Collector({ startupCommands: [] });
+    server = new DashboardServer({
+      collector,
+      resolver: new SourceMapResolver(async () => ''),
+      staticDir: os.tmpdir(),
+      port: 0,
+      status: { state: 'running', command: 'x' },
+      token: 'given-token-0123456789',
+      extraHost: null,
+      maxClientBuffer: LIMIT,
+    });
+    const url = await server.start();
+    streamUrl = `${url.slice(0, url.indexOf('/?'))}/api/stream?token=${server.token}`;
+    // About 4 MB of backlog: 60 times the live limit.
+    for (let i = 0; i < 200; i++) source('big');
+  });
+
+  after(async () => {
+    await server.close();
+    await collector.close();
+  });
+
+  /** Opens the stream paused; `read()` resumes it and collects until `done(body)` or the end. */
+  function paused(): Promise<{ read(done: (body: string) => boolean): Promise<{ body: string; ended: boolean }> }> {
+    return new Promise((resolve, reject) => {
+      http.get(streamUrl, (res) => {
+        res.pause();
+        resolve({
+          read: (done) =>
+            new Promise((finish) => {
+              let body = '';
+              let settled = false;
+              const settle = (ended: boolean): void => {
+                if (settled) return;
+                settled = true;
+                res.destroy();
+                finish({ body, ended });
+              };
+              res.setEncoding('utf8');
+              res.on('data', (c: string) => {
+                body += c;
+                if (done(body)) settle(false);
+              });
+              res.on('close', () => settle(true));
+              res.resume();
+            }),
+        });
+      }).on('error', reject);
+    });
+  }
+
+  const hellos = (body: string): number => body.split('"type":"hello"').length - 1;
+
+  it('sends a backlog far larger than the limit to a slow reader, then live records in order', async () => {
+    const client = await paused();
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    source('small');
+    source('small');
+    const { body, ended } = await client.read((text) => hellos(text) === 202);
+    assert.equal(ended, false, 'not dropped');
+    assert.equal(hellos(body), 202);
+    assert.ok(body.lastIndexOf(big) < body.indexOf('"small"'), 'live records after the backlog');
+  });
+
+  it('drops a reader that falls behind by more than the limit of live data', async () => {
+    const client = await paused();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    for (let i = 0; i < 5; i++) source('big');
+    const { ended, body } = await client.read(() => false);
+    assert.equal(ended, true);
+    assert.ok(hellos(body) < 205);
   });
 });

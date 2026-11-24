@@ -70,7 +70,7 @@
           <button type="button" data-value="60000" aria-pressed="false">1m</button>
           <button type="button" data-value="300000" aria-pressed="true">5m</button>
           <button type="button" data-value="900000" aria-pressed="false">15m</button>
-          <button type="button" data-value="0" aria-pressed="false">all</button>
+          <button type="button" id="window-all" data-value="0" aria-pressed="false" title="everything kept">all</button>
         </div>
         <button id="pause" type="button" class="ghost">Pause</button>
       </header>
@@ -120,7 +120,7 @@
             </div>
           </section>
           <section class="panel" id="iter-wrap" hidden>
-            <div class="panel-head"><h2>Loop iterations</h2><span class="muted">newest right · click one to inspect</span></div>
+            <div class="panel-head"><h2>Loop iterations</h2><span class="muted">newest right · click one, or focus and use the arrow keys, to inspect</span></div>
             <canvas id="iterations" class="iterations"></canvas>
             <div class="phase-bar" id="phase-bar"></div>
             <div id="iteration-detail" class="iteration-detail"></div>
@@ -212,13 +212,13 @@
             <div class="panel-head">
               <h2>Flame graph</h2><span class="muted" id="flame-note">start the CPU profile to see where time goes</span>
               <div class="spacer"></div>
-              <span id="flame-crumb" class="crumb"></span>
               <button id="flame-reset" type="button" class="ghost" hidden>Reset zoom</button>
             </div>
             <div class="flame-wrap" id="flame-wrap" hidden>
               <canvas id="flame" class="flame"></canvas>
               <div id="flame-tip" class="tip" hidden></div>
             </div>
+            <div class="flame-stack" id="flame-stack" hidden></div>
             <table class="table" id="hot" hidden><thead><tr><th class="num">self</th><th>function</th><th>where</th></tr></thead><tbody></tbody></table>
             <table class="table" id="changes" hidden><thead><tr><th class="num">change</th><th class="num">now</th><th class="num">baseline</th><th>function</th><th>where</th></tr></thead><tbody></tbody></table>
           </section>
@@ -257,11 +257,11 @@
           <section class="panel"><div id="chart-gc"></div></section>
           <div class="grid2">
             <section class="panel">
-              <div class="panel-head"><h2>Pause distribution</h2><span class="muted">pauses in the chart window</span></div>
+              <div class="panel-head"><h2>Pause distribution</h2><span class="muted" id="gc-histogram-note">pauses in the chart window</span></div>
               <div class="histogram" id="gc-histogram"></div>
             </section>
             <section class="panel">
-              <div class="panel-head"><h2>By kind</h2><span class="muted">in the chart window</span></div>
+              <div class="panel-head"><h2>By kind</h2><span class="muted" id="gc-kinds-note">in the chart window</span></div>
               <table class="table" id="gc-kinds"><thead><tr><th>kind</th><th class="num">runs</th><th class="num">avg</th><th class="num">max</th><th class="num">total</th></tr></thead><tbody></tbody></table>
             </section>
           </div>
@@ -290,7 +290,7 @@
             </section>
           </div>
           <section class="panel">
-            <div class="panel-head"><h2>Threads</h2><span class="muted">main and worker_threads; click one to switch</span></div>
+            <div class="panel-head"><h2>Threads</h2><span class="muted">main and worker_threads; pick one to switch</span></div>
             <table class="table" id="threads"><thead><tr><th>thread</th><th class="num">cpu</th><th class="num">loop delay p99</th><th class="num">heap used</th><th class="num">gc, 10 s</th></tr></thead><tbody></tbody></table>
           </section>
         </section>

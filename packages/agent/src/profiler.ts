@@ -1,7 +1,8 @@
 // CPU profiling and allocation sampling through an in-process inspector session:
 // no `--inspect`, no open port. One CDP call at a time, in order.
 
-import { Session } from 'node:inspector';
+import type * as Inspector from 'node:inspector';
+import { createRequire } from 'node:module';
 import type { WireProfile } from '@node-xray/core';
 import type { SelfWork } from './self.js';
 
@@ -11,7 +12,6 @@ export interface ProfilerDeps {
   /** `performance.now()`. */
   readonly now: () => number;
   readonly timeOrigin: number;
-  readonly addOverhead: (us: number) => void;
 }
 
 export interface CpuOptions {
@@ -24,13 +24,25 @@ export interface HeapOptions {
   readonly windowMs: number;
 }
 
+/**
+ * `node:inspector`, loaded when profiling starts: a Node built without the inspector must not
+ * fail the agent's preload (and with it the application); it fails this one command instead.
+ */
+function loadInspector(): typeof Inspector {
+  const getBuiltinModule: unknown = Reflect.get(process, 'getBuiltinModule');
+  const inspector: unknown =
+    typeof getBuiltinModule === 'function' ? getBuiltinModule.call(process, 'node:inspector') : createRequire(process.execPath)('node:inspector');
+  if (typeof inspector !== 'object' || inspector === null) throw new Error('node:inspector is not available in this Node');
+  return inspector as typeof Inspector;
+}
+
 /** `{ profile: ... }` result of `Profiler.stop` / `HeapProfiler.getSamplingProfile`. */
 function profileOf(result: unknown): unknown {
   return typeof result === 'object' && result !== null ? Reflect.get(result, 'profile') : undefined;
 }
 
 export class InspectorProfiler {
-  #session: Session | null = null;
+  #session: Inspector.Session | null = null;
   #queue: Promise<void> = Promise.resolve();
   #cpuTimer: NodeJS.Timeout | null = null;
   #cpuWindowStart = 0;
@@ -79,6 +91,7 @@ export class InspectorProfiler {
     this.#enqueue(async () => {
       await this.#heapWindow();
       await this.#post('HeapProfiler.stopSampling');
+      await this.#post('HeapProfiler.disable');
     });
   }
 
@@ -117,6 +130,8 @@ export class InspectorProfiler {
     }
   }
 
+  // Async steps run outside `SelfWork.run`, so they count their own time.
+
   /** Stop + send + restart: one window of the live flame graph. */
   async #cpuWindow(restart: boolean): Promise<void> {
     const started = this.deps.now();
@@ -125,7 +140,7 @@ export class InspectorProfiler {
     const end = this.deps.now();
     this.deps.send({ type: 'cpu-profile', start: this.deps.timeOrigin + this.#cpuWindowStart, end: this.deps.timeOrigin + started, profile });
     this.#cpuWindowStart = end;
-    this.deps.addOverhead((this.deps.now() - started) * 1000);
+    this.deps.self.addOverhead((this.deps.now() - started) * 1000);
   }
 
   /** The sampling profile is cumulative since `startSampling`. */
@@ -133,7 +148,7 @@ export class InspectorProfiler {
     const started = this.deps.now();
     const profile = profileOf(await this.#post('HeapProfiler.getSamplingProfile'));
     this.deps.send({ type: 'heap-profile', start: this.deps.timeOrigin + this.#heapStart, end: this.deps.timeOrigin + started, profile });
-    this.deps.addOverhead((this.deps.now() - started) * 1000);
+    this.deps.self.addOverhead((this.deps.now() - started) * 1000);
   }
 
   #enqueue(step: () => Promise<void>): void {
@@ -142,7 +157,7 @@ export class InspectorProfiler {
 
   #post(method: string, params: object = {}): Promise<unknown> {
     if (this.#session === null) {
-      this.#session = new Session();
+      this.#session = new (loadInspector().Session)();
       this.#session.connect();
     }
     const session = this.#session;

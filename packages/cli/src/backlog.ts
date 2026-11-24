@@ -2,7 +2,7 @@
 // bounded tail of everything else, so its own Timeline can catch up without the CLI
 // holding the whole run in memory.
 
-import { encodeRecord, Ring, type StreamMessage } from '@node-xray/core';
+import { encodeClosedRecord, encodeRecord, Ring, type StreamMessage } from '@node-xray/core';
 
 export interface BacklogLimits {
   /** Samples per connection: 3600 is an hour at 1 s, 15 min at 250 ms. */
@@ -27,6 +27,8 @@ interface ConnectionBacklog {
   readonly cpuProfiles: Ring<string>;
   heapProfile: string | null;
   readonly errors: Ring<string>;
+  /** The connection ended; replayed as a closed record after the rest. */
+  closed: boolean;
 }
 
 export class Backlog {
@@ -83,13 +85,24 @@ export class Backlog {
     }
   }
 
-  /** Records to replay, each connection's hello before the rest of it. */
+  closed(connection: number): void {
+    const entry = this.#connections.get(connection);
+    if (entry !== undefined) entry.closed = true;
+  }
+
+  /** Forgets an ended connection entirely (the collector dropped its source). */
+  drop(connection: number): void {
+    this.#connections.delete(connection);
+  }
+
+  /** Records to replay, each connection's hello before the rest of it and its end after. */
   records(): string[] {
     const out = this.#host.toArray();
-    for (const entry of this.#connections.values()) {
+    for (const [connection, entry] of this.#connections) {
       if (entry.hello === null) continue;
       out.push(entry.hello, ...entry.samples.toArray(), ...entry.http.toArray(), ...entry.io.toArray(), ...entry.traces.toArray(), ...entry.cpuProfiles.toArray(), ...entry.errors.toArray());
       if (entry.heapProfile !== null) out.push(entry.heapProfile);
+      if (entry.closed) out.push(encodeClosedRecord(connection));
     }
     return out;
   }
@@ -106,6 +119,7 @@ export class Backlog {
         cpuProfiles: new Ring(this.#limits.cpuProfiles),
         heapProfile: null,
         errors: new Ring(this.#limits.errors),
+        closed: false,
       };
       this.#connections.set(connection, entry);
     }

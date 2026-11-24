@@ -7,7 +7,7 @@ import { promisify } from 'node:util';
 import * as vscode from 'vscode';
 import { splitCommand } from './core/command.js';
 import { parseNodeProcesses } from './core/processes.js';
-import { HotLineDecorations, XraySession, type Target } from './session.js';
+import { HotLineDecorations, XraySession, settings, type Target } from './session.js';
 
 const RUNNABLE = new Set(['.js', '.mjs', '.cjs', '.ts', '.mts', '.cts']);
 
@@ -73,8 +73,7 @@ export function activate(context: vscode.ExtensionContext): void {
       if (document.isDirty) await document.save();
       const file = document.uri.fsPath;
       const cwd = vscode.workspace.getWorkspaceFolder(document.uri)?.uri.fsPath ?? path.dirname(file);
-      const node = vscode.workspace.getConfiguration('xray').get<string>('nodePath', 'node');
-      await start({ kind: 'run', program: node, args: [file], cwd, label: path.basename(file) });
+      await start({ kind: 'run', program: settings().nodePath, args: [file], cwd, label: path.basename(file) });
     }),
 
     vscode.commands.registerCommand('xray.run', async () => {
@@ -122,7 +121,7 @@ export function activate(context: vscode.ExtensionContext): void {
       await session?.stop();
     }),
 
-    vscode.commands.registerCommand('xray.clearHotLines', () => hotLines.show(null)),
+    vscode.commands.registerCommand('xray.clearHotLines', () => hotLines.clear()),
 
     { dispose: () => [...sessions].forEach((session) => session.dispose()) },
   );

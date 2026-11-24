@@ -1,7 +1,8 @@
 // Everything known about one source (process thread), fed by stream messages in arrival order.
 // The CLI keeps one per connected source; the dashboard keeps its own from the same stream.
 
-import { allocationFlame, cpuFlame, mergeFlames, type FlameTree } from './flame.js';
+import { culpritWindow, insightTime, stallCulprit, summarizeInsights, type CulpritWindow, type InsightSummary } from './findings.js';
+import { allocationFlame, cpuFlame, FlameSum, mergeFlames, withoutScript, type FlameTree } from './flame.js';
 import { deriveFrame, type Frame } from './frame.js';
 import type { HttpMessage } from './http.js';
 import type { IoMessage } from './io.js';
@@ -20,6 +21,8 @@ export interface TimelineOptions {
   readonly traceWindows: number;
   /** CPU profile windows kept for the merged flame graph. */
   readonly cpuWindows: number;
+  /** Per-window stall culprits (one small summary per CPU window): as many as frames, the whole run at 1 window/s. */
+  readonly culpritWindows: number;
   readonly hostSamples: number;
   readonly errors: number;
 }
@@ -30,16 +33,32 @@ export const DEFAULT_TIMELINE_OPTIONS: TimelineOptions = {
   loopEvents: 50_000,
   traceWindows: 600,
   cpuWindows: 12,
+  culpritWindows: 3600,
   hostSamples: 3600,
   errors: 50,
 };
 
+/** Which findings count: those that happened in `[since, until]`, epoch ms (everything kept by default). */
+export interface FindingsSpan {
+  readonly since?: number;
+  readonly until?: number;
+}
+
+/** A derived value and the version (and options) it was computed for. */
+interface Memo<T> {
+  readonly version: number;
+  readonly key: string;
+  readonly value: T;
+}
+
 export class Timeline {
+  #version = 0;
   #hello: Hello | null = null;
   #lastSample: Sample | null = null;
   #allocations: FlameTree | null = null;
-  /** Every CPU window since the start, merged as they arrive (the ring keeps only the last few). */
-  #cpuTotal: FlameTree | null = null;
+  /** Every CPU window since the start, summed as they arrive (the ring keeps only the last few). */
+  readonly #cpuTotal = new FlameSum();
+  readonly #culprits: Ring<CulpritWindow>;
   readonly #frames: Ring<Frame>;
   readonly #gc: Ring<GcEvent>;
   readonly #loopEvents: Ring<LoopEvent>;
@@ -51,6 +70,8 @@ export class Timeline {
   readonly #errors: Ring<string>;
   readonly #ledger = new TaskLedger();
   readonly #lines = new LineTicks();
+  #insights: Memo<readonly Insight[]> | null = null;
+  #findings: Memo<readonly InsightSummary[]> | null = null;
 
   constructor(overrides: Partial<TimelineOptions> = {}) {
     const options: TimelineOptions = { ...DEFAULT_TIMELINE_OPTIONS, ...overrides };
@@ -59,6 +80,7 @@ export class Timeline {
     this.#loopEvents = new Ring(options.loopEvents);
     this.#traceWindows = new Ring(options.traceWindows);
     this.#cpu = new Ring(options.cpuWindows);
+    this.#culprits = new Ring(options.culpritWindows);
     this.#host = new Ring(options.hostSamples);
     this.#http = new Ring(options.frames);
     this.#io = new Ring(options.frames);
@@ -66,20 +88,25 @@ export class Timeline {
   }
 
   apply(message: StreamMessage): void {
+    this.#version++;
     switch (message.type) {
       case 'hello':
-        // A new hello means a (re)started agent: its cumulative counters start over.
+        // A new hello means a (re)started agent: its cumulative counters and trace sessions start over.
         this.#hello = message;
         this.#lastSample = null;
+        this.#ledger.clear();
         break;
       case 'sample':
         this.#applySample(message);
         break;
       case 'cpu-profile': {
         const window = cpuFlame(message.profile, message);
+        const agentScript = this.#hello?.agentScript ?? '';
         this.#cpu.push(window);
-        this.#cpuTotal = this.#cpuTotal === null ? window : mergeFlames([this.#cpuTotal, window]);
-        this.#lines.add(message.profile, this.#hello?.agentScript ?? '');
+        this.#cpuTotal.add(window);
+        // The agent's own frames are not the application's work.
+        this.#culprits.push(culpritWindow(withoutScript(window, agentScript)));
+        this.#lines.add(message.profile, agentScript);
         break;
       }
       case 'heap-profile':
@@ -88,7 +115,7 @@ export class Timeline {
       case 'loop-trace':
         for (const event of toLoopEvents(message)) this.#loopEvents.push(event);
         this.#traceWindows.push(summarizeTrace(message));
-        this.#ledger.apply(message.counters);
+        this.#ledger.apply(message);
         break;
       case 'host':
         this.#host.push(message);
@@ -116,6 +143,11 @@ export class Timeline {
     if (this.#hello === null || prev === null) return;
     const frame = deriveFrame({ prev, cur: sample, facts: this.#hello });
     if (frame !== null) this.#frames.push(frame);
+  }
+
+  /** Bumped by every `apply`: derived values computed for one version stay valid until the next. */
+  get version(): number {
+    return this.#version;
   }
 
   get hello(): Hello | null {
@@ -160,7 +192,7 @@ export class Timeline {
 
   /** All CPU profiling of this source merged: what an export of the whole run contains. */
   cpuFlameTotal(): FlameTree | null {
-    return this.#cpuTotal;
+    return this.#cpuTotal.tree();
   }
 
   /** CPU samples per source line over the whole run (the agent's own lines left out). */
@@ -196,7 +228,42 @@ export class Timeline {
     return this.#http.toArray();
   }
 
-  insights(options: Partial<InsightOptions> = {}): Insight[] {
-    return [...analyze(this.#frames.toArray(), options), ...analyzeHttp(this.#http.toArray(), options), ...analyzeIo(this.#io.toArray(), options)];
+  /** Findings over everything kept, oldest first; computed once per version and options (callers share the array). */
+  insights(options: Partial<InsightOptions> = {}): readonly Insight[] {
+    const key = JSON.stringify(options);
+    const memo = this.#insights;
+    if (memo !== null && memo.version === this.#version && memo.key === key) return memo.value;
+    const value = [...analyze(this.#frames.toArray(), options), ...analyzeHttp(this.#http.toArray(), options), ...analyzeIo(this.#io.toArray(), options)];
+    this.#insights = { version: this.#version, key, value };
+    return value;
+  }
+
+  /**
+   * `insights` summarised per kind, a loop stall not caused by GC with the busiest function of the
+   * CPU window it fell in (over the whole run, not only the windows kept for the flame graph).
+   * Computed once per version, options and span. `span` keeps only the findings that happened in
+   * it (a chart window, a paused view): counts and the worst occurrence are of those.
+   */
+  findings(options: Partial<InsightOptions> = {}, { since = Number.NEGATIVE_INFINITY, until = Number.POSITIVE_INFINITY }: FindingsSpan = {}): readonly InsightSummary[] {
+    const key = `${JSON.stringify(options)}|${since}|${until}`;
+    const memo = this.#findings;
+    if (memo !== null && memo.version === this.#version && memo.key === key) return memo.value;
+    const all = this.insights(options);
+    const inSpan = Number.isFinite(since) || Number.isFinite(until) ? all.filter((insight) => insightTime(insight) >= since && insightTime(insight) <= until) : all;
+    const value = summarizeInsights(inSpan).map((summary) => {
+      const worst = summary.worst;
+      if (worst.kind !== 'loop-stall' || worst.cause !== 'unknown') return summary;
+      // The stall happened somewhere in its frame, which a stall stretches: look back over the whole frame.
+      const frame = this.#frameAt(worst.t);
+      return { ...summary, ...stallCulprit(this.#culprits.toArray(), { t: worst.t, spanMs: Math.max(frame?.dt ?? 0, worst.delay) }) };
+    });
+    this.#findings = { version: this.#version, key, value };
+    return value;
+  }
+
+  #frameAt(t: number): Frame | undefined {
+    const frames = this.#frames.toArray();
+    for (let i = frames.length - 1; i >= 0; i--) if (frames[i]?.t === t) return frames[i];
+    return undefined;
   }
 }

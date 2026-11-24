@@ -1,4 +1,6 @@
 // File system and DNS timings. DNS: Node's own `dns` performance entries (no patching, always on).
+// Node writes an entry only for a lookup that succeeded, so failed lookups are not seen at all
+// (`dns.errors` stays 0; nothing compatible publishes them without patching `dns`).
 // File system: Node publishes nothing, so `fs` timing wraps the module's functions; it is opt-in
 // (a command) and every wrapper hands the call through unchanged except for the timing.
 
@@ -6,10 +8,12 @@ import fsModule from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import { performance, PerformanceObserver, type PerformanceEntry } from 'node:perf_hooks';
 import { bucketOf, HTTP_BUCKET_COUNT, type IoExample, type IoMessage, type IoOperation, type IoSide } from '@node-xray/core';
-import type { SelfWork } from './self.js';
+import { SelfWork } from './self.js';
 
 const MAX_OPERATIONS = 100;
 const EXAMPLES = 5;
+const CALIBRATION_CALLS = 500;
+const MAX_WRAPPER_COST_US = 20;
 
 /** One kind of call (async fs, sync fs, DNS) for one tick. */
 export class IoAggregator {
@@ -88,8 +92,13 @@ interface Timer {
   readonly enabled: () => boolean;
   readonly record: (key: string, ms: number, failed: boolean) => void;
   /**
-   * Sync calls in progress. `readFileSync` calls `openSync`, `readSync`, `closeSync` through the
-   * module's exports: only the outermost call is timed, or the blocked time is counted twice.
+   * Above 0 while Node is working on a timed fs call. Node builds some calls from others through
+   * the module's exports (`readFileSync` → `openSync`, `readSync`, `closeSync`; `appendFile` →
+   * `writeFile` → `open`, `write`, `close`, each from the previous one's callback): only the
+   * outermost call is timed, or the same time is counted several times. Set while the outer
+   * call's original runs and while the callbacks of its inner calls run; 0 again while the
+   * application's own callback runs, so its next fs calls are timed. A promise API's inner calls
+   * after its first `await` cannot be told apart (`fs.promises.rm`, `cp`).
    */
   readonly nesting: { depth: number };
 }
@@ -104,18 +113,44 @@ function lookAlike<F extends AnyFunction>(wrapper: F, original: AnyFunction): F 
   return wrapper;
 }
 
+/** `original.apply(self, args)` marked as part of a timed fs call. */
+function nested(nesting: { depth: number }, original: AnyFunction, self: unknown, args: unknown[]): unknown {
+  nesting.depth++;
+  try {
+    return original.apply(self, args);
+  } finally {
+    nesting.depth--;
+  }
+}
+
 export function wrapCallback(operation: string, original: AnyFunction, timer: Timer): AnyFunction {
+  const { nesting } = timer;
   return lookAlike(function timed(this: unknown, ...args: unknown[]): unknown {
     const last = args.length - 1;
     const callback = args[last];
-    if (!timer.enabled() || timer.self.active || typeof callback !== 'function') return original.apply(this, args);
+    if (typeof callback !== 'function') return original.apply(this, args);
+    if (nesting.depth > 0) {
+      // A part of a timed call: its callback carries that call on, so it runs marked too.
+      args[last] = function (this: unknown, ...results: unknown[]): unknown {
+        return nested(nesting, callback as AnyFunction, this, results);
+      };
+      return original.apply(this, args);
+    }
+    if (!timer.enabled() || timer.self.active) return original.apply(this, args);
     const key = operationKey(operation, args[0]);
     const start = performance.now();
     args[last] = function (this: unknown, error: unknown, ...rest: unknown[]): unknown {
       timer.record(key, performance.now() - start, error !== null && error !== undefined);
-      return (callback as AnyFunction).call(this, error, ...rest);
+      // The application's own callback: the fs calls it makes are timed on their own.
+      const depth = nesting.depth;
+      nesting.depth = 0;
+      try {
+        return (callback as AnyFunction).call(this, error, ...rest);
+      } finally {
+        nesting.depth = depth;
+      }
     };
-    return original.apply(this, args);
+    return nested(nesting, original, this, args);
   }, original);
 }
 
@@ -124,11 +159,12 @@ export function wrapCallback(operation: string, original: AnyFunction, timer: Ti
  * handled and silence the application's own unhandled rejections.
  */
 export function wrapPromise(operation: string, original: AnyFunction, timer: Timer): AnyFunction {
+  const { nesting } = timer;
   return lookAlike(function timed(this: unknown, ...args: unknown[]): unknown {
-    if (!timer.enabled() || timer.self.active) return original.apply(this, args);
+    if (nesting.depth > 0 || !timer.enabled() || timer.self.active) return original.apply(this, args);
     const key = operationKey(operation, args[0]);
     const start = performance.now();
-    const result = original.apply(this, args);
+    const result = nested(nesting, original, this, args);
     if (!(result instanceof Promise)) return result;
     return result.then(
       (value: unknown) => {
@@ -149,16 +185,41 @@ export function wrapSync(operation: string, original: AnyFunction, timer: Timer)
     const key = operationKey(`${operation}Sync`, args[0]);
     const start = performance.now();
     let failed = true;
-    timer.nesting.depth++;
     try {
-      const value = original.apply(this, args);
+      const value = nested(timer.nesting, original, this, args);
       failed = false;
       return value;
     } finally {
-      timer.nesting.depth--;
       timer.record(key, performance.now() - start, failed);
     }
   }, original);
+}
+
+/**
+ * Main-thread cost of one timed fs call, µs: a wrapped call of an instant function against the
+ * function itself. Timing every call would add clock reads to each; this cost times the number
+ * of calls is the wrappers' share of the agent's overhead.
+ */
+export function measureWrapperCost(now: () => number): number {
+  const original: AnyFunction = (_path: unknown, callback: unknown) => (callback as AnyFunction)(null);
+  const scratch = new IoAggregator();
+  const wrapped = wrapCallback('stat', original, {
+    self: new SelfWork(() => undefined),
+    enabled: () => true,
+    record: (key, ms, failed) => scratch.record(key, ms, failed),
+    nesting: { depth: 0 },
+  });
+  const done = (): void => undefined;
+  const burst = (fn: AnyFunction): number => {
+    const started = now();
+    for (let i = 0; i < CALIBRATION_CALLS; i++) fn('/calibrate', done);
+    return now() - started;
+  };
+  burst(original);
+  burst(wrapped);
+  const plain = burst(original);
+  const timed = burst(wrapped);
+  return Math.min(MAX_WRAPPER_COST_US, Math.max(0, ((timed - plain) * 1000) / CALIBRATION_CALLS));
 }
 
 interface Patch {
@@ -174,7 +235,6 @@ export interface IoMonitorDeps {
   readonly now: () => number;
   readonly timeOrigin: number;
   readonly intervalMs: number;
-  readonly addOverhead: (us: number) => void;
 }
 
 export class IoMonitor {
@@ -186,6 +246,10 @@ export class IoMonitor {
   #lastTick = 0;
   #fsOn = false;
   #patches: Patch[] = [];
+  /** Shared by every wrapper: Node's inner calls cross callback, promise and sync APIs. */
+  readonly #nesting = { depth: 0 };
+  /** µs per timed fs call, measured when fs timing first starts. */
+  #wrapperCostUs = -1;
   /** Nothing is sent until the process did any DNS or timed fs: no empty ticks. */
   #active = false;
 
@@ -203,36 +267,42 @@ export class IoMonitor {
     this.#timer = self.own(setInterval(() => self.run(() => this.tick()), this.deps.intervalMs).unref());
   }
 
-  /** Wraps the `fs` functions once; later starts and stops only switch the timing on and off. */
+  /**
+   * Wraps every `fs` function not wrapped yet. A wrapper someone else wrapped on top stays in
+   * place across `stopFs` (only switched off), so a restart wraps just the ones put back.
+   */
   startFs(): void {
     this.#fsOn = true;
-    if (this.#patches.length > 0) return;
+    if (this.#wrapperCostUs < 0) this.#wrapperCostUs = measureWrapperCost(this.deps.now);
     // The object `require('fs')` returns to the application: what it calls through.
     const fs = fsModule as unknown as Record<string, unknown>;
     const promises = fs['promises'] as Record<string, unknown>;
-    const nesting = { depth: 0 };
     const timer = (aggregator: IoAggregator): Timer => ({
       self: this.deps.self,
-      nesting,
+      nesting: this.#nesting,
       enabled: () => this.#fsOn,
       record: (key, ms, failed) => {
         this.#active = true;
         aggregator.record(key, ms, failed);
+        this.deps.self.addOverhead(this.#wrapperCostUs);
       },
     });
     const patch = (target: Record<string, unknown>, name: string, wrap: (original: AnyFunction) => AnyFunction): void => {
+      if (this.#patches.some((p) => p.target === target && p.name === name)) return;
       const original = target[name];
       if (typeof original !== 'function') return;
       const wrapper = wrap(original as AnyFunction);
       target[name] = wrapper;
       this.#patches.push({ target, name, original, wrapper });
     };
+    const asyncTimer = timer(this.fs);
+    const syncTimer = timer(this.fsSync);
     for (const operation of FS_OPERATIONS) {
-      patch(fs, operation, (original) => wrapCallback(operation, original, timer(this.fs)));
-      patch(promises, operation, (original) => wrapPromise(operation, original, timer(this.fs)));
-      patch(fs, `${operation}Sync`, (original) => wrapSync(operation, original, timer(this.fsSync)));
+      patch(fs, operation, (original) => wrapCallback(operation, original, asyncTimer));
+      patch(promises, operation, (original) => wrapPromise(operation, original, asyncTimer));
+      patch(fs, `${operation}Sync`, (original) => wrapSync(operation, original, syncTimer));
     }
-    patch(fs, 'existsSync', (original) => wrapSync('exists', original, timer(this.fsSync)));
+    patch(fs, 'existsSync', (original) => wrapSync('exists', original, syncTimer));
     // `import { readFile } from 'node:fs'` sees the wrappers too.
     syncBuiltinESMExports();
   }
@@ -269,15 +339,13 @@ export class IoMonitor {
       dns: this.dns.snapshot(),
     });
     this.#lastTick = started;
-    this.deps.addOverhead((this.deps.now() - started) * 1000);
   }
 
   #recordDns(entry: PerformanceEntry): void {
     const detail: unknown = Reflect.get(entry, 'detail');
     const host = typeof detail === 'object' && detail !== null ? Reflect.get(detail, 'hostname') ?? Reflect.get(detail, 'host') : undefined;
-    const addresses = typeof detail === 'object' && detail !== null ? Reflect.get(detail, 'addresses') ?? Reflect.get(detail, 'result') : undefined;
-    const failed = Array.isArray(addresses) ? addresses.length === 0 : false;
     this.#active = true;
-    this.dns.record(`${entry.name}${typeof host === 'string' ? ` ${host}` : ''}`, entry.duration, failed);
+    // Only successful lookups have an entry (see the top of this file).
+    this.dns.record(`${entry.name}${typeof host === 'string' ? ` ${host}` : ''}`, entry.duration, false);
   }
 }

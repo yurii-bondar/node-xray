@@ -29,7 +29,8 @@ export class CdpError extends Error {
 export interface Cdp {
   /** The `result` of a call; throws CdpError on a protocol error or a closed connection. */
   send(method: string, params?: object): Promise<unknown>;
-  on(method: string, handler: (params: unknown) => void): void;
+  /** Returns the function that removes the handler again. */
+  on(method: string, handler: (params: unknown) => void): () => void;
   /** Resolves when the connection ends (detach, or the process exited). */
   readonly closed: Promise<void>;
   close(): void;
@@ -85,6 +86,11 @@ function cdpOver(transmit: (text: string) => void, closed: Promise<void>, close:
     },
     on(method, handler) {
       handlers.set(method, [...(handlers.get(method) ?? []), handler]);
+      return () => {
+        const rest = (handlers.get(method) ?? []).filter((h) => h !== handler);
+        if (rest.length > 0) handlers.set(method, rest);
+        else handlers.delete(method);
+      };
     },
     closed,
     close,
@@ -130,13 +136,18 @@ export function workerCdp(parent: Cdp, sessionId: string): Cdp {
       end();
     },
   );
-  parent.on('NodeWorker.receivedMessageFromWorker', (params) => {
+  const offMessage = parent.on('NodeWorker.receivedMessageFromWorker', (params) => {
     if (typeof params !== 'object' || params === null || Reflect.get(params, 'sessionId') !== sessionId) return;
     const message: unknown = Reflect.get(params, 'message');
     if (typeof message === 'string') receive(message);
   });
-  parent.on('NodeWorker.detachedFromWorker', (params) => {
+  const offDetached = parent.on('NodeWorker.detachedFromWorker', (params) => {
     if (typeof params === 'object' && params !== null && Reflect.get(params, 'sessionId') === sessionId) end();
+  });
+  // A pool that churns workers must not leave a pair of handlers on the main session per worker.
+  void closed.then(() => {
+    offMessage();
+    offDetached();
   });
   return cdp;
 }

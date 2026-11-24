@@ -202,7 +202,7 @@ export interface LoopTraceCounter {
   readonly resource: string;
   readonly created: number;
   readonly executed: number;
-  /** Destroyed, or resolved for promises. */
+  /** Done with: promises resolved; Timeout and Immediate fired or cleared; other resources ran their callback once. */
   readonly settled: number;
   /** Time spent in callbacks of this type, ms (exact even when events were dropped). */
   readonly busy: number;
@@ -401,11 +401,9 @@ function parseSample(f: Fields): Sample {
   };
 }
 
-function dictionaryEntry(dictionary: readonly string[], index: number, path: string): string {
-  if (index === -1) return '';
-  const value = dictionary[index];
-  if (value === undefined) throw new ProtocolError(path, `index into a dictionary of ${dictionary.length}`);
-  return value;
+/** The entry, '' for -1, `null` for an index outside the dictionary. */
+function dictionaryEntry(dictionary: readonly string[], index: number): string | null {
+  return index === -1 ? '' : (dictionary[index] ?? null);
 }
 
 function parseLoopTrace(f: Fields): LoopTraceMessage {
@@ -416,16 +414,20 @@ function parseLoopTrace(f: Fields): LoopTraceMessage {
   if (flat.length % LOOP_EVENT_STRIDE !== 0) throw new ProtocolError(f.at('events'), `a multiple of ${LOOP_EVENT_STRIDE} numbers`);
   const events: LoopTraceEvent[] = new Array<LoopTraceEvent>(flat.length / LOOP_EVENT_STRIDE);
   for (let i = 0, e = 0; i < flat.length; i += LOOP_EVENT_STRIDE, e++) {
-    const path = `${f.at('events')}[${i}]`;
     // Length is a multiple of the stride, so every slot below exists.
-    const at = (offset: number): number => flat[i + offset] as number;
+    const resource = dictionaryEntry(types, flat[i] as number);
+    const name = dictionaryEntry(names, flat[i + 5] as number);
+    if (resource === null || name === null) {
+      const size = resource === null ? types.length : names.length;
+      throw new ProtocolError(`${f.at('events')}[${i}]`, `index into a dictionary of ${size}`);
+    }
     events[e] = {
-      resource: dictionaryEntry(types, at(0), path),
-      iteration: at(1),
-      start: start + at(2) / 1000,
-      duration: at(3) / 1000,
-      depth: at(4),
-      name: dictionaryEntry(names, at(5), path),
+      resource,
+      iteration: flat[i + 1] as number,
+      start: start + (flat[i + 2] as number) / 1000,
+      duration: (flat[i + 3] as number) / 1000,
+      depth: flat[i + 4] as number,
+      name,
     };
   }
   return {

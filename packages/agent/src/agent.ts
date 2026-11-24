@@ -8,7 +8,7 @@ import type { Link } from './connection.js';
 import { HttpMonitor } from './http-monitor.js';
 import { IoMonitor } from './io-monitor.js';
 import { InspectorProfiler } from './profiler.js';
-import { Sampler, uvCounters } from './sampler.js';
+import { loopCountReader, Sampler } from './sampler.js';
 import { errorMessage, SelfWork } from './self.js';
 import { cpuCount, SwapReader } from './system.js';
 import { LoopTracer } from './tracer.js';
@@ -67,24 +67,16 @@ export function startAgent({ link, intervalMs, agentScript }: AgentOptions): Age
 
   // During process exit nothing runs after the hook, so every message is written synchronously.
   let exiting = false;
-  function deliver(message: WireMessage): void {
-    if (exiting) connection.sendNow(message);
-    else connection.send(message);
+  /** False when the link dropped the message. */
+  function deliver(message: WireMessage): boolean {
+    return exiting ? connection.sendNow(message) : connection.send(message);
   }
 
   const sampler = new Sampler({ self, swap: new SwapReader((error) => self.report(error)), intervalMs, send: deliver });
-  const addOverhead = (us: number): void => sampler.addOverhead(us);
-  const tracer = new LoopTracer({
-    self,
-    send: deliver,
-    now,
-    timeOrigin: performance.timeOrigin,
-    loopCount: () => uvCounters()?.loopCount ?? -1,
-    addOverhead,
-  });
-  const profiler = new InspectorProfiler({ self, send: deliver, now, timeOrigin: performance.timeOrigin, addOverhead });
-  const http = new HttpMonitor({ self, send: deliver, now, timeOrigin: performance.timeOrigin, intervalMs, addOverhead });
-  const io = new IoMonitor({ self, send: deliver, now, timeOrigin: performance.timeOrigin, intervalMs, addOverhead });
+  const tracer = new LoopTracer({ self, send: deliver, now, timeOrigin: performance.timeOrigin, loopCount: loopCountReader() });
+  const profiler = new InspectorProfiler({ self, send: deliver, now, timeOrigin: performance.timeOrigin });
+  const http = new HttpMonitor({ self, send: deliver, now, timeOrigin: performance.timeOrigin, intervalMs });
+  const io = new IoMonitor({ self, send: deliver, now, timeOrigin: performance.timeOrigin, intervalMs });
 
   function handle(command: AgentCommand): void {
     switch (command.type) {

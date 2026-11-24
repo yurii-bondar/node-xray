@@ -2,13 +2,15 @@
 // processes and worker threads get it too), watch until it exits, summarise.
 
 import { spawn, type ChildProcess } from 'node:child_process';
+import { rmSync, statSync } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import type { SourceReport } from '@node-xray/core';
 import type { RunOptions } from './args.js';
 import { assets } from './assets.js';
-import { openSession, waitForInterrupt } from './session.js';
+import { windowsSpawnPlan, type SpawnPlan } from './command.js';
+import { Interrupts, openSession, type Session } from './session.js';
 
 /** After the command exits, how long to wait for agents' last messages. */
 const DRAIN_MS = 1000;
@@ -17,6 +19,51 @@ const DRAIN_MS = 1000;
 export function withPreload(nodeOptions: string | undefined, agentPath: string): string {
   const quoted = `"${agentPath.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
   return [nodeOptions?.trim(), `--require ${quoted}`].filter((part) => part !== undefined && part !== '').join(' ');
+}
+
+/** Variables for xray itself that the profiled program and its children must not see: the token opens `/api`. */
+const PRIVATE_ENV: ReadonlySet<string> = new Set(['XRAY_DASHBOARD_TOKEN', 'XRAY_DASHBOARD_HOST']);
+
+export interface ChildEnvArgs {
+  /** The preload bundle. */
+  readonly agent: string;
+  readonly socketPath: string;
+  readonly intervalMs: number;
+}
+
+/** The command's environment: ours without xray's private variables, plus what the agent needs. */
+export function childEnv(parent: NodeJS.ProcessEnv, { agent, socketPath, intervalMs }: ChildEnvArgs): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  // Names are case-insensitive on Windows.
+  for (const [name, value] of Object.entries(parent)) if (!PRIVATE_ENV.has(name.toUpperCase())) env[name] = value;
+  env['NODE_OPTIONS'] = withPreload(parent['NODE_OPTIONS'], agent);
+  env['XRAY_SOCKET'] = socketPath;
+  env['XRAY_INTERVAL_MS'] = String(intervalMs);
+  return env;
+}
+
+function spawnPlan(command: string, args: readonly string[]): SpawnPlan {
+  if (process.platform !== 'win32') return { file: command, args, verbatim: false };
+  return windowsSpawnPlan(command, args, {
+    path: process.env['PATH'] ?? '',
+    pathext: process.env['PATHEXT'] ?? '',
+    cwd: process.cwd(),
+    comspec: process.env['ComSpec'] ?? 'cmd.exe',
+    isFile: (file) => statSync(file, { throwIfNoEntry: false })?.isFile() ?? false,
+  });
+}
+
+export interface StartArgs {
+  readonly command: string;
+  readonly args: readonly string[];
+  readonly env: NodeJS.ProcessEnv;
+  readonly stdio: 'inherit' | 'pipe';
+}
+
+/** Spawns the command as `xray run` does: on Windows a `.cmd` / `.bat` (npm, npx) through cmd.exe. */
+export function startCommand({ command, args, env, stdio }: StartArgs): ChildProcess {
+  const plan = spawnPlan(command, args);
+  return spawn(plan.file, [...plan.args], { stdio, env, windowsVerbatimArguments: plan.verbatim });
 }
 
 function socketPathIn(dir: string): string {
@@ -38,13 +85,14 @@ interface Exit {
   readonly signal: NodeJS.Signals | null;
 }
 
-/** Ctrl+C reaches the whole process group: the command gets it directly and we wait for it. */
+/**
+ * Ctrl+C reaches the whole process group: the command gets it directly and we wait for it (the
+ * run's `Interrupts` keeps it from killing xray). SIGTERM and SIGHUP are passed on.
+ */
 async function waitForExit(child: ChildProcess, command: string, stderr: NodeJS.WritableStream): Promise<Exit> {
-  const ignore = (): void => undefined;
   const forward = (signal: NodeJS.Signals): void => {
     child.kill(signal);
   };
-  process.on('SIGINT', ignore);
   process.on('SIGTERM', forward);
   process.on('SIGHUP', forward);
   try {
@@ -56,7 +104,6 @@ async function waitForExit(child: ChildProcess, command: string, stderr: NodeJS.
       child.once('exit', (code, signal) => resolve({ code, signal }));
     });
   } finally {
-    process.off('SIGINT', ignore);
     process.off('SIGTERM', forward);
     process.off('SIGHUP', forward);
   }
@@ -85,19 +132,19 @@ export interface RunResult {
 }
 
 export async function run(options: RunOptions, stderr: NodeJS.WritableStream = process.stderr): Promise<RunResult> {
-  const dir = await mkdtemp(path.join(os.tmpdir(), 'xray-'));
-  const session = await openSession({ options, status: { state: 'running', command: commandLine(options) }, stderr, probeHost: true });
+  const interrupts = new Interrupts();
+  let session: Session | null = null;
+  let dir: string | null = null;
   try {
+    session = await openSession({ options, status: { state: 'running', command: commandLine(options) }, stderr, probeHost: true });
+    dir = await mkdtemp(path.join(os.tmpdir(), 'xray-'));
     const socketPath = socketPathIn(dir);
     await session.collector.listen(socketPath);
-    const child = spawn(options.command, [...options.args], {
+    const child = startCommand({
+      command: options.command,
+      args: options.args,
+      env: childEnv(process.env, { agent: assets().agent, socketPath, intervalMs: options.intervalMs }),
       stdio: 'inherit',
-      env: {
-        ...process.env,
-        NODE_OPTIONS: withPreload(process.env['NODE_OPTIONS'], assets().agent),
-        XRAY_SOCKET: socketPath,
-        XRAY_INTERVAL_MS: String(options.intervalMs),
-      },
     });
     const exit = await waitForExit(child, options.command, stderr);
     const code = exitCode(exit.code, exit.signal);
@@ -106,12 +153,15 @@ export async function run(options: RunOptions, stderr: NodeJS.WritableStream = p
     if (session.dashboard !== null) {
       session.dashboard.setStatus({ state: 'exited', command: commandLine(options), code });
       stderr.write(`xray: '${options.command}' exited with ${code}; the dashboard stays up. Ctrl+C to finish.\n`);
-      await waitForInterrupt();
+      await interrupts.wait();
     }
+    const tempDir = dir;
+    interrupts.finishing({ stderr, cleanup: () => rmSync(tempDir, { recursive: true, force: true }) });
     const outcome = await session.finish();
     return { exitCode: runExitCode({ code, signal: exit.signal, budgetsFailed: outcome.failed }), sources: outcome.sources };
   } finally {
-    await session.close();
-    await rm(dir, { recursive: true, force: true });
+    await session?.close();
+    if (dir !== null) await rm(dir, { recursive: true, force: true });
+    interrupts.dispose();
   }
 }

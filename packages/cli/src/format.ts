@@ -9,8 +9,9 @@ import {
   formatPercent as percent,
   formatShare,
   TASK_CATEGORIES,
+  type CallStack,
+  type FlameFrame,
   type HostReport,
-  type HotFunction,
   type InsightSummary,
   type BudgetResult,
   formatMetric,
@@ -25,7 +26,18 @@ import {
 function insightLine(summary: InsightSummary, report: SourceReport, options: FormatOptions): string {
   const times = summary.count > 1 ? ` ×${summary.count}, worst:` : '';
   const culprit = summary.culprit === null ? '' : `\n      likely in ${summary.culprit.name}${location(summary.culprit, options)} (${formatShare(summary.culprit.selfShare)} of CPU in that window)`;
-  return `  ! ${summary.kind}${times} ${describeInsight(summary.worst, report.from)}${culprit}`;
+  const stack = summary.culpritStack === null ? '' : callerLines(summary.culpritStack, options);
+  return `  ! ${summary.kind}${times} ${describeInsight(summary.worst, report.from)}${culprit}${stack}`;
+}
+
+/** Callers shown under a culprit, nearest first. */
+const MAX_CALLERS = 6;
+
+function callerLines(stack: CallStack, options: FormatOptions): string {
+  const callers = stack.frames.slice(0, -1).reverse();
+  const lines = callers.slice(0, MAX_CALLERS).map((frame) => `\n        ← ${frame.name}${location(frame, options)}`);
+  if (callers.length > MAX_CALLERS) lines.push(`\n        … ${callers.length - MAX_CALLERS} more`);
+  return lines.join('');
 }
 
 export interface FormatOptions {
@@ -50,7 +62,7 @@ export function shortPath(file: string, cwd: string): string {
   return relative !== '' && !relative.startsWith('..') && !path.isAbsolute(relative) ? relative : local;
 }
 
-function location(fn: HotFunction, options: FormatOptions): string {
+function location(fn: FlameFrame, options: FormatOptions): string {
   if (fn.url === '') return '';
   const original = options.originals.get(positionKey(fn));
   if (original !== undefined) return `  ${shortPath(original.file, options.cwd)}:${original.line}`;

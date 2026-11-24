@@ -1,7 +1,7 @@
 // Everything the page knows, fed by the SSE stream: one Timeline per agent connection,
-// the host probe, and the status of the launched command. No DOM here.
+// the host probe, the status of the launched command and of the stream itself. No DOM here.
 
-import { HOST_CONNECTION, parseRecord, Timeline, toSourceId, type Hello, type SourceId, type StreamRecord } from '@node-xray/core';
+import { HOST_CONNECTION, parseRecord, Timeline, toSourceId, type Hello, type RecordEntry, type SourceId } from '@node-xray/core';
 
 export type RunStatus =
   | { readonly state: 'running'; readonly command: string }
@@ -30,6 +30,45 @@ export interface SourceEntry {
   readonly id: SourceId;
   readonly hello: Hello;
   readonly timeline: Timeline;
+  /** Its agent connection closed: the data stays for reading, commands cannot reach it. */
+  readonly ended: boolean;
+}
+
+/** Ended sources kept for reading; older ones are dropped (live ones are always kept). */
+export const MAX_ENDED_SOURCES = 16;
+
+/** The SSE stream to the CLI: `lost` until the browser reconnects (the CLI may be gone). */
+export type Connection = 'connecting' | 'open' | 'lost';
+
+export type Tone = 'neutral' | 'live' | 'done';
+
+export interface HeaderState {
+  readonly text: string;
+  readonly tone: Tone;
+  /** Commands can reach an agent. */
+  readonly live: boolean;
+}
+
+/** What the header says about the run, and whether commands make sense. */
+export function headerState(status: RunStatus | null, connection: Connection): HeaderState {
+  if (connection === 'lost' && status?.state !== 'replay') {
+    return { text: status === null ? 'reconnecting…' : `reconnecting… · ${status.command}`, tone: 'done', live: false };
+  }
+  if (status === null) return { text: 'connecting…', tone: 'neutral', live: connection !== 'lost' };
+  switch (status.state) {
+    case 'running':
+      return { text: `live · ${status.command}`, tone: 'live', live: true };
+    case 'detached':
+      return { text: `detached · ${status.command}`, tone: 'done', live: false };
+    case 'replay':
+      return { text: status.command, tone: 'done', live: false };
+    case 'exited':
+      return { text: `exited ${status.code} · ${status.command}`, tone: 'done', live: false };
+    default: {
+      const unreachable: never = status;
+      return unreachable;
+    }
+  }
 }
 
 /** `node server.js`: the script without its directory. */
@@ -45,9 +84,12 @@ export function sourceLabel(hello: Hello): string {
 
 export class Store {
   readonly #byConnection = new Map<number, Timeline>();
+  /** Ended sources, oldest first. */
+  readonly #ended: SourceId[] = [];
   readonly sources = new Map<SourceId, SourceEntry>();
   host = new Timeline();
   status: RunStatus | null = null;
+  connection: Connection = 'connecting';
   /** Bad records seen; shown, not thrown. */
   rejected = 0;
   /** Bumped on every change, so views can skip work when nothing moved. */
@@ -55,6 +97,7 @@ export class Store {
 
   reset(): void {
     this.#byConnection.clear();
+    this.#ended.length = 0;
     this.sources.clear();
     this.host = new Timeline();
     this.rejected = 0;
@@ -67,8 +110,19 @@ export class Store {
     else this.rejected++;
   }
 
-  apply({ connection, message }: StreamRecord): void {
+  setConnection(connection: Connection): void {
+    if (this.connection === connection) return;
+    this.connection = connection;
     this.revision++;
+  }
+
+  apply(record: RecordEntry): void {
+    this.revision++;
+    if ('closed' in record) {
+      this.#close(record.connection);
+      return;
+    }
+    const { connection, message } = record;
     if (connection === HOST_CONNECTION) {
       this.host.apply(message);
       return;
@@ -81,17 +135,36 @@ export class Store {
     timeline.apply(message);
     if (message.type === 'hello') {
       const id = toSourceId(message.pid, message.threadId);
-      this.sources.set(id, { id, hello: message, timeline });
+      this.sources.set(id, { id, hello: message, timeline, ended: false });
+      const at = this.#ended.indexOf(id);
+      if (at !== -1) this.#ended.splice(at, 1);
     }
   }
 
-  /** The main thread of the first process, else whatever is there. */
-  defaultSource(): SourceEntry | undefined {
-    let first: SourceEntry | undefined;
-    for (const source of this.sources.values()) {
-      if (source.hello.threadId === 0) return source;
-      first ??= source;
+  #close(connection: number): void {
+    const timeline = this.#byConnection.get(connection);
+    if (timeline === undefined) return;
+    this.#byConnection.delete(connection);
+    for (const entry of this.sources.values()) {
+      if (entry.timeline !== timeline || entry.ended) continue;
+      this.sources.set(entry.id, { ...entry, ended: true });
+      this.#ended.push(entry.id);
     }
-    return first;
+    while (this.#ended.length > MAX_ENDED_SOURCES) {
+      const oldest = this.#ended.shift();
+      if (oldest !== undefined) this.sources.delete(oldest);
+    }
+  }
+
+  /** The main thread of the first live process, else any live source, else the newest ended one. */
+  defaultSource(): SourceEntry | undefined {
+    let live: SourceEntry | undefined;
+    for (const source of this.sources.values()) {
+      if (source.ended) continue;
+      if (source.hello.threadId === 0) return source;
+      live ??= source;
+    }
+    const newest = this.#ended[this.#ended.length - 1];
+    return live ?? (newest === undefined ? undefined : this.sources.get(newest));
   }
 }
